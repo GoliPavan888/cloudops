@@ -11,6 +11,7 @@ import {
   Server,
   Box,
   Zap,
+  Brain,
   KeyRound,
 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
@@ -231,7 +232,7 @@ export default function Dashboard() {
             <div className="mt-5 grid grid-cols-2 gap-4 xl:grid-cols-4 2xl:grid-cols-8">
               <MetricCard icon={Coins} label="Monthly Cost" value={formatMoney(latestCost)} />
               <MetricCard icon={Database} label="Active Resources" value={metrics.totalResources || 0} />
-              <MetricCard icon={HardDrive} label="IAM Users" value={metrics.totalUsers || users.length} />
+              <MetricCard icon={HardDrive} label="IAM Users" value={metrics.totalUsers || users.length} onClick={() => navigate("/iam")} />
               <MetricCard
                 icon={ShieldAlert}
                 label="Security Findings"
@@ -247,6 +248,7 @@ export default function Dashboard() {
               <MetricCard icon={Box} label="S3 Buckets" value={serviceBreakdown.S3 || 0} onClick={() => navigate("/s3")} />
               <MetricCard icon={Server} label="EC2 Instances" value={serviceBreakdown.EC2 || 0} onClick={() => navigate("/ec2")} />
               <MetricCard icon={Database} label="RDS Databases" value={serviceBreakdown.RDS || 0} onClick={() => navigate("/rds")} />
+              <MetricCard icon={Brain} label="Lambda Functions" value={serviceBreakdown.Lambda || 0} onClick={() => navigate("/lambda")} />
             </div>
           </section>
 

@@ -16,6 +16,16 @@ import {
 	getRDSMetrics,
 	getRDSActivity,
 	getRDSSecurity,
+	listLambda,
+	getLambdaDetail,
+	getLambdaMetrics,
+	getLambdaActivity,
+	getLambdaSecurity,
+	listIAM,
+	getIAMUserDetail,
+	getIAMUserMetrics,
+	getIAMUserActivity,
+	getIAMUserSecurity,
 } from "../services/awsService.js";
 
 const router = express.Router();
@@ -43,5 +53,19 @@ router.post("/rds/:id", getRDSDetail);
 router.post("/rds/:id/metrics", getRDSMetrics);
 router.post("/rds/:id/activity", getRDSActivity);
 router.post("/rds/:id/security", getRDSSecurity);
+
+// Lambda APIs
+router.post("/lambda", listLambda);
+router.post("/lambda/:name", getLambdaDetail);
+router.post("/lambda/:name/metrics", getLambdaMetrics);
+router.post("/lambda/:name/activity", getLambdaActivity);
+router.post("/lambda/:name/security", getLambdaSecurity);
+
+// IAM APIs
+router.post("/iam", listIAM);
+router.post("/iam/:userName", getIAMUserDetail);
+router.post("/iam/:userName/metrics", getIAMUserMetrics);
+router.post("/iam/:userName/activity", getIAMUserActivity);
+router.post("/iam/:userName/security", getIAMUserSecurity);
 
 export default router;

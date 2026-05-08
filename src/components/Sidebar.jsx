@@ -6,8 +6,8 @@ const sections = [
 	{ key: "ec2", label: "EC2 Instances", icon: Server, path: "/ec2" },
 	{ key: "s3", label: "S3 Buckets", icon: Cloud, path: "/s3" },
 	{ key: "rds", label: "RDS Databases", icon: Database, path: "/rds" },
-	{ key: "lambda", label: "Lambda Functions", icon: Brain, path: "/dashboard" },
-	{ key: "iam", label: "IAM", icon: ShieldCheck, path: "/dashboard" },
+	{ key: "lambda", label: "Lambda Functions", icon: Brain, path: "/lambda" },
+	{ key: "iam", label: "IAM", icon: ShieldCheck, path: "/iam" },
 	{ key: "logs", label: "CloudWatch Logs", icon: FileText, path: "/dashboard" },
 	{ key: "dynamo", label: "DynamoDB", icon: Boxes, path: "/dashboard" },
 	{ key: "sqs", label: "SQS Queues", icon: Layers3, path: "/dashboard" }

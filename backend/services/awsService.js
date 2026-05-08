@@ -1,5 +1,25 @@
 import { STSClient, AssumeRoleCommand } from "@aws-sdk/client-sts";
-import { IAMClient, ListUsersCommand, ListRolesCommand } from "@aws-sdk/client-iam";
+import {
+  IAMClient,
+  ListUsersCommand,
+  ListRolesCommand,
+  ListGroupsCommand,
+  GetUserCommand,
+  GetLoginProfileCommand,
+  ListMFADevicesCommand,
+  ListGroupsForUserCommand,
+  ListAttachedUserPoliciesCommand,
+  ListUserPoliciesCommand,
+  ListAccessKeysCommand,
+  ListAttachedGroupPoliciesCommand,
+  ListGroupPoliciesCommand,
+  GetUserPolicyCommand,
+  GetGroupPolicyCommand,
+  GetAccessKeyLastUsedCommand,
+  GetPolicyVersionCommand,
+  ListAttachedRolePoliciesCommand,
+  ListRolePoliciesCommand,
+} from "@aws-sdk/client-iam";
 import {
   S3Client,
   ListBucketsCommand,
@@ -17,10 +37,23 @@ import {
 } from "@aws-sdk/client-s3";
 import { EC2Client, DescribeInstancesCommand, DescribeVolumesCommand, DescribeSecurityGroupsCommand } from "@aws-sdk/client-ec2";
 import { RDSClient, DescribeDBInstancesCommand } from "@aws-sdk/client-rds";
-import { LambdaClient, ListFunctionsCommand } from "@aws-sdk/client-lambda";
+import {
+  LambdaClient,
+  ListFunctionsCommand,
+  GetFunctionCommand,
+  GetFunctionUrlConfigCommand,
+  ListEventSourceMappingsCommand,
+  GetPolicyCommand,
+  ListTagsCommand,
+} from "@aws-sdk/client-lambda";
 import { DynamoDBClient, ListTablesCommand } from "@aws-sdk/client-dynamodb";
 import { SQSClient, ListQueuesCommand } from "@aws-sdk/client-sqs";
-import { CloudWatchLogsClient, DescribeLogGroupsCommand } from "@aws-sdk/client-cloudwatch-logs";
+import {
+  CloudWatchLogsClient,
+  DescribeLogGroupsCommand,
+  DescribeLogStreamsCommand,
+  GetLogEventsCommand,
+} from "@aws-sdk/client-cloudwatch-logs";
 import { CostExplorerClient, GetCostAndUsageCommand } from "@aws-sdk/client-cost-explorer";
 import { SecurityHubClient, GetFindingsCommand } from "@aws-sdk/client-securityhub";
 import { CloudWatchClient, GetMetricDataCommand } from "@aws-sdk/client-cloudwatch";
@@ -427,8 +460,11 @@ async function assumeRoleAndClients(roleArn, region = process.env.AWS_REGION || 
   };
 
   const clients = {
+    iamClient: new IAMClient({ region, credentials }),
     ec2Client: new EC2Client({ region, credentials }),
     s3Client: new S3Client({ region, credentials }),
+    lambdaClient: new LambdaClient({ region, credentials }),
+    logsClient: new CloudWatchLogsClient({ region, credentials }),
     cloudwatchClient: new CloudWatchClient({ region, credentials }),
     cloudtrailClient: new CloudTrailClient({ region, credentials }),
     ceClient: new CostExplorerClient({ region: "us-east-1", credentials }),
@@ -1728,6 +1764,1005 @@ export const getRDSSecurity = async (req, res) => {
     };
 
     return res.json({ success: true, analysis: summary });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+function parseArnAccountId(arn = "") {
+  return String(arn || "").split(":")[4] || "";
+}
+
+function summarizeIamPolicyNames(attachedPolicies = [], inlinePolicyNames = []) {
+  return {
+    attachedManagedPolicies: attachedPolicies.map((policy) => policy.PolicyArn || policy.PolicyName).filter(Boolean),
+    inlinePolicies: inlinePolicyNames.filter(Boolean),
+  };
+}
+
+async function readPolicyDocument(iamClient, policyArn) {
+  if (!policyArn) return null;
+  try {
+    const policy = await iamClient.send(new GetPolicyCommand({ PolicyArn: policyArn }));
+    const defaultVersionId = policy.Policy?.DefaultVersionId;
+    if (!defaultVersionId) return null;
+    const version = await iamClient.send(new GetPolicyVersionCommand({ PolicyArn: policyArn, VersionId: defaultVersionId }));
+    const doc = version.PolicyVersion?.Document;
+    return typeof doc === "string" ? safeParseEvent(doc) || null : doc || null;
+  } catch {
+    return null;
+  }
+}
+
+function documentHasWildcardPermissions(doc) {
+  const text = JSON.stringify(doc || {});
+  return /"Action"\s*:\s*"\*"|"Action"\s*:\s*\[.*?"\*".*?\]|"Resource"\s*:\s*"\*"/i.test(text);
+}
+
+function documentHasAdminAccess(doc, policyName = "") {
+  const text = JSON.stringify(doc || {}).toLowerCase();
+  return /administratoraccess/.test(String(policyName || "").toLowerCase()) || /"effect":"allow"/.test(text) && documentHasWildcardPermissions(doc);
+}
+
+async function collectIamUserSummary(clients, user) {
+  const userName = user.UserName;
+  const [groupsResp, attachedUserPoliciesResp, inlineUserPoliciesResp, accessKeysResp, mfaResp, loginProfileResp] = await Promise.all([
+    clients.iamClient.send(new ListGroupsForUserCommand({ UserName: userName })).catch(() => ({ Groups: [] })),
+    clients.iamClient.send(new ListAttachedUserPoliciesCommand({ UserName: userName })).catch(() => ({ AttachedPolicies: [] })),
+    clients.iamClient.send(new ListUserPoliciesCommand({ UserName: userName })).catch(() => ({ PolicyNames: [] })),
+    clients.iamClient.send(new ListAccessKeysCommand({ UserName: userName })).catch(() => ({ AccessKeyMetadata: [] })),
+    clients.iamClient.send(new ListMFADevicesCommand({ UserName: userName })).catch(() => ({ MFADevices: [] })),
+    clients.iamClient.send(new GetLoginProfileCommand({ UserName: userName })).catch(() => null),
+  ]);
+
+  const groups = groupsResp.Groups || [];
+  const groupPolicies = [];
+  const groupPolicyDocs = [];
+
+  for (const group of groups) {
+    const attached = await clients.iamClient.send(new ListAttachedGroupPoliciesCommand({ GroupName: group.GroupName })).catch(() => ({ AttachedPolicies: [] }));
+    const inline = await clients.iamClient.send(new ListGroupPoliciesCommand({ GroupName: group.GroupName })).catch(() => ({ PolicyNames: [] }));
+    groupPolicies.push(...summarizeIamPolicyNames(attached.AttachedPolicies || [], inline.PolicyNames || []).attachedManagedPolicies);
+
+    for (const policy of attached.AttachedPolicies || []) {
+      const doc = await readPolicyDocument(clients.iamClient, policy.PolicyArn);
+      if (doc) groupPolicyDocs.push({ policyName: policy.PolicyName, document: doc });
+    }
+
+    for (const policyName of inline.PolicyNames || []) {
+      const policy = await clients.iamClient.send(new GetGroupPolicyCommand({ GroupName: group.GroupName, PolicyName: policyName })).catch(() => null);
+      const doc = policy?.PolicyDocument ? (typeof policy.PolicyDocument === "string" ? safeParseEvent(policy.PolicyDocument) : policy.PolicyDocument) : null;
+      if (doc) groupPolicyDocs.push({ policyName, document: doc });
+    }
+  }
+
+  const policyDocs = [];
+  for (const policy of attachedUserPoliciesResp.AttachedPolicies || []) {
+    const doc = await readPolicyDocument(clients.iamClient, policy.PolicyArn);
+    if (doc) policyDocs.push({ policyName: policy.PolicyName, document: doc, policyArn: policy.PolicyArn });
+  }
+
+  for (const policyName of inlineUserPoliciesResp.PolicyNames || []) {
+    const policy = await clients.iamClient.send(new GetUserPolicyCommand({ UserName: userName, PolicyName: policyName })).catch(() => null);
+    const doc = policy?.PolicyDocument ? (typeof policy.PolicyDocument === "string" ? safeParseEvent(policy.PolicyDocument) : policy.PolicyDocument) : null;
+    if (doc) policyDocs.push({ policyName, document: doc, inline: true });
+  }
+
+  const accessKeys = (accessKeysResp.AccessKeyMetadata || []).map((key) => ({
+    accessKeyId: key.AccessKeyId,
+    status: key.Status,
+    createDate: key.CreateDate,
+    ageDays: key.CreateDate ? Math.floor((Date.now() - new Date(key.CreateDate).getTime()) / 86400000) : null,
+  }));
+
+  const accessKeysWithUsage = await Promise.all(
+    accessKeys.map(async (key) => {
+      const usage = await clients.iamClient.send(new GetAccessKeyLastUsedCommand({ AccessKeyId: key.accessKeyId })).catch(() => null);
+      return {
+        ...key,
+        lastUsedTime: usage?.AccessKeyLastUsed?.LastUsedDate || null,
+        lastUsedService: usage?.AccessKeyLastUsed?.ServiceName || null,
+        lastUsedRegion: usage?.AccessKeyLastUsed?.Region || null,
+        rotationStatus: key.ageDays != null && key.ageDays > 90 ? "Rotate" : "Fresh",
+      };
+    })
+  );
+
+  const cloudTrail = await clients.cloudtrailClient.send(
+    new LookupEventsCommand({
+      LookupAttributes: [{ AttributeKey: "Username", AttributeValue: userName }],
+      MaxResults: 100,
+    })
+  ).catch(() => ({ Events: [] }));
+
+  const activity = (cloudTrail.Events || []).map((event) => {
+    const parsed = safeParseEvent(event.CloudTrailEvent) || {};
+    const identity = parsed.userIdentity || {};
+    return {
+      eventName: event.EventName,
+      eventTime: event.EventTime,
+      sourceIp: parsed.sourceIPAddress || null,
+      userAgent: parsed.userAgent || null,
+      assumedRole: identity.sessionContext?.sessionIssuer?.arn || null,
+      resource: event.Resources?.[0]?.ResourceName || null,
+      resourceType: event.Resources?.[0]?.ResourceType || null,
+      username: userName,
+      requestParameters: parsed.requestParameters || null,
+    };
+  });
+
+  const createdEvent = activity.find((event) => /createuser|createaccesskey|addusertogroup/i.test(String(event.eventName || ""))) || activity[activity.length - 1] || null;
+  const modifiedEvent = activity.find((event) => /updateuser|attachuserpolicy|detachuserpolicy|putuserpolicy|deleteuserpolicy|addusertogroup|removeuserfromgroup/i.test(String(event.eventName || ""))) || activity[0] || null;
+
+  const attachedManagedPolicies = attachedUserPoliciesResp.AttachedPolicies || [];
+  const inlinePolicies = inlineUserPoliciesResp.PolicyNames || [];
+  const effectivePolicyDocs = [...policyDocs, ...groupPolicyDocs];
+  const wildcardPermissions = effectivePolicyDocs.some(({ document }) => documentHasWildcardPermissions(document));
+  const administratorAccess = effectivePolicyDocs.some(({ document, policyName }) => documentHasAdminAccess(document, policyName));
+  const assumeRolePermissions = effectivePolicyDocs.some(({ document }) => JSON.stringify(document || {}).toLowerCase().includes("sts:assumerole"));
+  const crossAccountAccess = effectivePolicyDocs.some(({ document }) => JSON.stringify(document || {}).includes('"AWS":"*"'));
+
+  const consoleAccessEnabled = Boolean(loginProfileResp?.LoginProfile);
+  const mfaEnabled = Boolean((mfaResp.MFADevices || []).length);
+  const failedLogins = activity.filter((event) => /failed|denied/i.test(String(event.eventName || ""))).length;
+  const recentLogin = activity.find((event) => /consolelogin|signin/i.test(String(event.eventName || "")))?.eventTime || null;
+
+  const resourceOwnership = {
+    ec2Instances: activity.filter((event) => /runinstances/i.test(String(event.eventName || ""))).length,
+    s3Buckets: activity.filter((event) => /createbucket/i.test(String(event.eventName || ""))).length,
+    lambdaFunctions: activity.filter((event) => /createfunction/i.test(String(event.eventName || ""))).length,
+    rdsDatabases: activity.filter((event) => /createdbinstance/i.test(String(event.eventName || ""))).length,
+    iamRoles: activity.filter((event) => /createrole/i.test(String(event.eventName || ""))).length,
+    policies: activity.filter((event) => /createpolicy/i.test(String(event.eventName || ""))).length,
+  };
+
+  const groupsList = groups.map((group) => group.GroupName).filter(Boolean);
+
+  const summary = {
+    userName,
+    arn: user.UserArn,
+    accountId: parseArnAccountId(user.UserArn),
+    userId: user.UserId,
+    creationDate: user.CreateDate || null,
+    path: user.Path || "/",
+    tags: (user.Tags || []).map((tag) => ({ key: tag.Key, value: tag.Value })),
+    consoleAccessEnabled,
+    lastConsoleLogin: recentLogin,
+    passwordLastUsed: user.PasswordLastUsed || null,
+    mfaEnabled,
+    groups: groupsList,
+    attachedRoles: Array.from(new Set(activity.filter((event) => /assumerole/i.test(String(event.eventName || ""))).map((event) => event.assumedRole).filter(Boolean))),
+
+    accessKeys: accessKeysWithUsage,
+
+    attachedManagedPolicies,
+    inlinePolicies,
+    groupPermissions: groupPolicies,
+    effectivePermissions: Array.from(new Set([...attachedManagedPolicies.map((p) => p.PolicyName || p.PolicyArn), ...inlinePolicies, ...groupPolicies])),
+    administratorAccess,
+    wildcardPermissions,
+    crossAccountAccess,
+    assumeRolePermissions,
+    privilegeEscalationRisks: administratorAccess || wildcardPermissions || assumeRolePermissions,
+
+    mfaEnforcement: mfaEnabled,
+    rootAccessDetection: /root/i.test(userName),
+    overprivilegedAccess: administratorAccess || wildcardPermissions,
+    unusedCredentials: accessKeysWithUsage.some((key) => !key.lastUsedTime),
+    inactiveUser: !recentLogin || (user.PasswordLastUsed && (Date.now() - new Date(user.PasswordLastUsed).getTime()) > 90 * 86400000),
+    passwordPolicyCompliance: consoleAccessEnabled ? "Review" : "N/A",
+    consoleLoginActivity: consoleAccessEnabled ? "Enabled" : "Disabled",
+    failedLoginAttempts: failedLogins,
+    apiUsageActivity: activity.filter((event) => !/signin|consolelogin/i.test(String(event.eventName || ""))).length,
+
+    recentApiCalls: activity.slice(0, 15),
+    cloudTrailActivity: activity.slice(0, 50),
+    consoleLoginHistory: activity.filter((event) => /signin|consolelogin/i.test(String(event.eventName || ""))).slice(0, 20),
+    regionActivity: Array.from(new Set(activity.map((event) => event.region).filter(Boolean))),
+    resourceCreationActivity: activity.filter((event) => /create|runinstances|putbucket|createfunction|createdbinstance|createrole|createpolicy/i.test(String(event.eventName || ""))),
+    resourceDeletionActivity: activity.filter((event) => /delete|terminate/i.test(String(event.eventName || ""))),
+    permissionChanges: activity.filter((event) => /attach|detach|putuserpolicy|deleteuserpolicy|addusertogroup|removeuserfromgroup|putgrouppolicy|deletegrouppolicy/i.test(String(event.eventName || ""))),
+    assumedRoles: Array.from(new Set(activity.map((event) => event.assumedRole).filter(Boolean))),
+    sourceIps: Array.from(new Set(activity.map((event) => event.sourceIp).filter(Boolean))),
+    userAgents: Array.from(new Set(activity.map((event) => event.userAgent).filter(Boolean))),
+
+    createdBy: createdEvent ? toEventIdentity(createdEvent).createdBy : null,
+    sourceIp: createdEvent ? toEventIdentity(createdEvent).sourceIp : null,
+    eventName: createdEvent?.eventName || null,
+    eventTime: createdEvent?.eventTime || null,
+    lastModifiedBy: modifiedEvent ? toEventIdentity(modifiedEvent).createdBy : null,
+    assumedRole: modifiedEvent ? toEventIdentity(modifiedEvent).assumedRole : null,
+    permissionChangesAttribution: activity.filter((event) => /attach|detach|putuserpolicy|deleteuserpolicy|putgrouppolicy|deletegrouppolicy/i.test(String(event.eventName || ""))),
+    accessKeyCreation: activity.filter((event) => /createaccesskey/i.test(String(event.eventName || ""))),
+    loginEvents: activity.filter((event) => /signin|consolelogin/i.test(String(event.eventName || ""))),
+    policyAttachments: activity.filter((event) => /attachuserpolicy|attachgrouppolicy/i.test(String(event.eventName || ""))),
+    groupChanges: activity.filter((event) => /addusertogroup|removeuserfromgroup/i.test(String(event.eventName || ""))),
+
+    resourcesCreated: resourceOwnership,
+    recentInfrastructureChanges: activity.filter((event) => /create|delete|update|put/i.test(String(event.eventName || ""))).slice(0, 20),
+
+    loginTrend: activity.filter((event) => /signin|consolelogin/i.test(String(event.eventName || ""))),
+    apiUsageTrend: activity.filter((event) => !/signin|consolelogin/i.test(String(event.eventName || ""))),
+    mostUsedServices: activity.reduce((acc, event) => {
+      const service = String(event.resourceType || event.eventName || "Unknown");
+      acc[service] = (acc[service] || 0) + 1;
+      return acc;
+    }, {}),
+    regionUsage: activity.reduce((acc, event) => {
+      const regionKey = event.region || "unknown";
+      acc[regionKey] = (acc[regionKey] || 0) + 1;
+      return acc;
+    }, {}),
+    permissionChangeTimeline: activity.filter((event) => /attach|detach|putuserpolicy|deleteuserpolicy|putgrouppolicy|deletegrouppolicy/i.test(String(event.eventName || ""))),
+    userActivityTimeline: activity.slice(0, 50),
+    failedAuthenticationTrends: failedLogins,
+
+    securityRiskScore: 100,
+    securitySeverity: "Low",
+    complianceStatus: { compliant: false, status: "Unknown", violations: [] },
+    detections: [],
+  };
+
+  const findings = [
+    administratorAccess ? "AdministratorAccess attached" : null,
+    !mfaEnabled ? "No MFA enabled" : null,
+    accessKeysWithUsage.some((key) => (key.ageDays || 0) > 90) ? "Old access keys" : null,
+    accessKeysWithUsage.some((key) => !key.lastUsedTime) ? "Unused access keys" : null,
+    wildcardPermissions ? "Wildcard policies" : null,
+    summary.inactiveUser ? "Inactive user" : null,
+    crossAccountAccess ? "Cross-account risk" : null,
+    assumeRolePermissions ? "Privilege escalation risk" : null,
+    summary.overprivilegedAccess ? "Excessive permissions" : null,
+    failedLogins > 0 ? "Suspicious login activity" : null,
+    failedLogins > 3 ? "Failed login attempts" : null,
+  ].filter(Boolean);
+
+  let score = 100;
+  if (!mfaEnabled) score -= 25;
+  if (administratorAccess) score -= 20;
+  if (wildcardPermissions) score -= 15;
+  if (accessKeysWithUsage.some((key) => (key.ageDays || 0) > 90)) score -= 10;
+  if (accessKeysWithUsage.some((key) => !key.lastUsedTime)) score -= 10;
+  if (summary.inactiveUser) score -= 10;
+  if (failedLogins > 3) score -= 10;
+  if (crossAccountAccess) score -= 10;
+  if (assumeRolePermissions) score -= 10;
+  score = Math.max(0, Math.min(100, score));
+
+  let severity = "Low";
+  if (score < 40) severity = "Critical";
+  else if (score < 60) severity = "High";
+  else if (score < 80) severity = "Medium";
+
+  summary.securityRiskScore = score;
+  summary.securitySeverity = severity;
+  summary.complianceStatus = {
+    compliant: findings.length === 0,
+    status: findings.length === 0 ? "Compliant" : findings.length >= 3 ? "Non-Compliant" : "At Risk",
+    violations: findings,
+  };
+  summary.detections = findings;
+
+  return summary;
+}
+
+export const listIAM = async (req, res) => {
+  try {
+    const { roleArn } = req.body;
+    if (!roleArn) return res.status(400).json({ success: false, message: "roleArn required" });
+    const region = req.body.region || process.env.AWS_REGION || "us-east-1";
+    const accountId = parseArnAccountId(roleArn);
+    const clients = await assumeRoleAndClients(roleArn, region);
+
+    const [usersResp, groupsResp, rolesResp] = await Promise.all([
+      clients.iamClient.send(new ListUsersCommand({})),
+      clients.iamClient.send(new ListGroupsCommand({})).catch(() => ({ Groups: [] })),
+      clients.iamClient.send(new ListRolesCommand({})),
+    ]);
+
+    const users = [];
+    for (const user of usersResp.Users || []) {
+      try {
+        users.push(await collectIamUserSummary(clients, user));
+      } catch (error) {
+        console.warn(`IAM user summary failed for ${user.UserName}:`, error.message);
+      }
+    }
+
+    const groups = (groupsResp.Groups || []).map((group) => ({
+      type: "Group",
+      name: group.GroupName,
+      arn: group.Arn,
+      path: group.Path,
+      createDate: group.CreateDate,
+      userCount: 0,
+      risk: "Low",
+    }));
+
+    const roles = (rolesResp.Roles || []).map((role) => ({
+      type: "Role",
+      name: role.RoleName,
+      arn: role.Arn,
+      path: role.Path,
+      createDate: role.CreateDate,
+      description: role.Description,
+      risk: role.RoleName === "AdministratorAccess" ? "Critical" : "Low",
+    }));
+
+    return res.json({
+      success: true,
+      users,
+      groups,
+      roles,
+      meta: {
+        accountId,
+        region,
+        totalUsers: users.length,
+        totalGroups: groups.length,
+        totalRoles: roles.length,
+        mfaUsers: users.filter((user) => user.mfaEnabled).length,
+        adminUsers: users.filter((user) => user.administratorAccess).length,
+        highRiskUsers: users.filter((user) => user.securitySeverity === "High" || user.securitySeverity === "Critical").length,
+      },
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+export const getIAMUserDetail = async (req, res) => {
+  try {
+    const { roleArn } = req.body;
+    const userName = req.params.userName;
+    if (!roleArn) return res.status(400).json({ success: false, message: "roleArn required" });
+    if (!userName) return res.status(400).json({ success: false, message: "userName required" });
+
+    const region = req.body.region || process.env.AWS_REGION || "us-east-1";
+    const clients = await assumeRoleAndClients(roleArn, region);
+    const userResp = await clients.iamClient.send(new GetUserCommand({ UserName: userName }));
+    const user = userResp.User;
+    if (!user) return res.status(404).json({ success: false, message: "User not found" });
+
+    const detail = await collectIamUserSummary(clients, user);
+    return res.json({ success: true, detail });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+export const getIAMUserMetrics = async (req, res) => {
+  try {
+    const { roleArn } = req.body;
+    const userName = req.params.userName;
+    if (!roleArn) return res.status(400).json({ success: false, message: "roleArn required" });
+    if (!userName) return res.status(400).json({ success: false, message: "userName required" });
+
+    const region = req.body.region || process.env.AWS_REGION || "us-east-1";
+    const clients = await assumeRoleAndClients(roleArn, region);
+    const user = await clients.iamClient.send(new GetUserCommand({ UserName: userName }));
+    const detail = user.User ? await collectIamUserSummary(clients, user.User) : null;
+
+    const activity = detail?.cloudTrailActivity || [];
+    const loginTrend = activity.filter((event) => /signin|consolelogin/i.test(String(event.eventName || ""))).slice(0, 12).map((event, index) => ({ index, value: 1 }));
+    const apiUsageTrend = activity.filter((event) => !/signin|consolelogin/i.test(String(event.eventName || ""))).slice(0, 12).map((event, index) => ({ index, value: 1 }));
+
+    return res.json({
+      success: true,
+      metrics: {
+        loginTrend,
+        apiUsageTrend,
+        failedAuthenticationTrends: detail?.failedAuthenticationTrends || 0,
+        regionUsage: detail?.regionUsage || {},
+        mostUsedServices: detail?.mostUsedServices || {},
+        permissionChangeTimeline: detail?.permissionChangeTimeline || [],
+        userActivityTimeline: detail?.userActivityTimeline || [],
+      },
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+export const getIAMUserActivity = async (req, res) => {
+  try {
+    const { roleArn } = req.body;
+    const userName = req.params.userName;
+    if (!roleArn) return res.status(400).json({ success: false, message: "roleArn required" });
+    if (!userName) return res.status(400).json({ success: false, message: "userName required" });
+
+    const region = req.body.region || process.env.AWS_REGION || "us-east-1";
+    const clients = await assumeRoleAndClients(roleArn, region);
+    const cloudTrail = await clients.cloudtrailClient.send(
+      new LookupEventsCommand({
+        LookupAttributes: [{ AttributeKey: "Username", AttributeValue: userName }],
+        MaxResults: 100,
+      })
+    ).catch(() => ({ Events: [] }));
+
+    const activities = (cloudTrail.Events || []).map((event) => ({
+      eventId: event.EventId,
+      eventName: event.EventName,
+      eventTime: event.EventTime,
+      username: event.Username,
+      resource: event.Resources?.[0]?.ResourceName || null,
+      resourceType: event.Resources?.[0]?.ResourceType || null,
+      cloudTrailEvent: event.CloudTrailEvent,
+    }));
+
+    return res.json({ success: true, activities });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+export const getIAMUserSecurity = async (req, res) => {
+  try {
+    const { roleArn } = req.body;
+    const userName = req.params.userName;
+    if (!roleArn) return res.status(400).json({ success: false, message: "roleArn required" });
+    if (!userName) return res.status(400).json({ success: false, message: "userName required" });
+
+    const region = req.body.region || process.env.AWS_REGION || "us-east-1";
+    const clients = await assumeRoleAndClients(roleArn, region);
+    const userResp = await clients.iamClient.send(new GetUserCommand({ UserName: userName }));
+    const detail = userResp.User ? await collectIamUserSummary(clients, userResp.User) : null;
+
+    if (!detail) return res.status(404).json({ success: false, message: "User not found" });
+
+    return res.json({
+      success: true,
+      analysis: {
+        securityRiskScore: detail.securityRiskScore,
+        securitySeverity: detail.securitySeverity,
+        complianceStatus: detail.complianceStatus,
+        findings: detail.detections,
+        administratorAccess: detail.administratorAccess,
+        wildcardPermissions: detail.wildcardPermissions,
+        crossAccountAccess: detail.crossAccountAccess,
+        mfaEnabled: detail.mfaEnabled,
+        consoleAccessEnabled: detail.consoleAccessEnabled,
+        accessKeys: detail.accessKeys,
+        mfaEnforcement: detail.mfaEnforcement,
+        rootAccessDetection: detail.rootAccessDetection,
+        overprivilegedAccess: detail.overprivilegedAccess,
+        unusedCredentials: detail.unusedCredentials,
+        inactiveUser: detail.inactiveUser,
+      },
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+function parseRoleName(roleArn = "") {
+  const value = String(roleArn || "");
+  const index = value.lastIndexOf("/");
+  return index >= 0 ? value.slice(index + 1) : value;
+}
+
+function evaluateLambdaSecurity(lambda) {
+  let score = 100;
+  if (!lambda.kmsEncrypted) score -= 15;
+  if (!lambda.codeSigningEnabled) score -= 5;
+  if (lambda.publicFunctionUrl) score -= 20;
+  if (lambda.crossAccountAccess) score -= 20;
+  if (lambda.secretsExposureDetection) score -= 15;
+  if (lambda.excessiveIamPermissions) score -= 10;
+  if (!lambda.deadLetterQueueConfigured) score -= 10;
+  if (lambda.timeout > 120) score -= 5;
+  score = Math.max(0, Math.min(100, score));
+
+  let severity = "Low";
+  if (score < 40) severity = "Critical";
+  else if (score < 60) severity = "High";
+  else if (score < 80) severity = "Medium";
+
+  return { score, severity };
+}
+
+function buildLambdaCompliance(lambda) {
+  const violations = [];
+  if (!lambda.kmsEncrypted) violations.push("KMS encryption not configured for environment variables");
+  if (lambda.publicFunctionUrl) violations.push("Function URL is publicly accessible");
+  if (lambda.crossAccountAccess) violations.push("Cross-account invoke permissions detected");
+  if (lambda.secretsExposureDetection) violations.push("Potential secrets in environment variables");
+  if (!lambda.deadLetterQueueConfigured) violations.push("No dead letter queue configured");
+  if (lambda.oldRuntimeVersion) violations.push("Function uses an old runtime version");
+
+  return {
+    compliant: violations.length === 0,
+    status: violations.length === 0 ? "Compliant" : violations.length >= 3 ? "Non-Compliant" : "At Risk",
+    violations,
+  };
+}
+
+function buildLambdaCostEstimate(lambda) {
+  const monthlyInvocations = Number(lambda.invocationCount || 0);
+  const avgDurationMs = Number(lambda.avgDurationMs || 0);
+  const memoryGb = Math.max(0.125, Number(lambda.memorySize || 128) / 1024);
+
+  const requestCost = (monthlyInvocations / 1000000) * 0.2;
+  const durationGbSeconds = monthlyInvocations * (avgDurationMs / 1000) * memoryGb;
+  const durationCost = durationGbSeconds * 0.0000166667;
+  const provisionedConcurrencyCost = lambda.provisionedConcurrency > 0 ? lambda.provisionedConcurrency * 730 * 0.0000041667 : 0;
+
+  return {
+    estimatedMonthlyCost: requestCost + durationCost + provisionedConcurrencyCost,
+    invocationCost: requestCost,
+    durationCost,
+    requestCost,
+    provisionedConcurrencyCost,
+    costOptimizationSuggestions: [
+      lambda.timeout > 120 ? "Reduce timeout to lower billed duration risk" : null,
+      lambda.idleFunctionDetection ? "Consider disabling or removing idle function" : null,
+      lambda.memorySize >= 2048 ? "Validate if memory can be right-sized" : null,
+      !lambda.deadLetterQueueConfigured ? "Configure DLQ to avoid repeated failure cost" : null,
+    ].filter(Boolean),
+  };
+}
+
+function inferConnectedService(arn = "") {
+  const value = String(arn || "").toLowerCase();
+  if (value.includes(":sqs:")) return "SQS";
+  if (value.includes(":kinesis:")) return "Kinesis";
+  if (value.includes(":dynamodb:")) return "DynamoDB Streams";
+  if (value.includes(":mq:")) return "Amazon MQ";
+  if (value.includes(":kafka:")) return "MSK";
+  if (value.includes(":s3:")) return "S3";
+  return "Unknown";
+}
+
+async function collectLambdaMetrics(cloudwatchClient, functionName, days = 7) {
+  const end = new Date();
+  const start = new Date(Date.now() - days * 24 * 3600 * 1000);
+  const dimensions = [{ Name: "FunctionName", Value: functionName }];
+
+  const queries = [
+    { Id: "invocations", MetricStat: { Metric: { Namespace: "AWS/Lambda", MetricName: "Invocations", Dimensions: dimensions }, Period: 3600, Stat: "Sum" } },
+    { Id: "errors", MetricStat: { Metric: { Namespace: "AWS/Lambda", MetricName: "Errors", Dimensions: dimensions }, Period: 3600, Stat: "Sum" } },
+    { Id: "duration", MetricStat: { Metric: { Namespace: "AWS/Lambda", MetricName: "Duration", Dimensions: dimensions }, Period: 3600, Stat: "Average" } },
+    { Id: "throttles", MetricStat: { Metric: { Namespace: "AWS/Lambda", MetricName: "Throttles", Dimensions: dimensions }, Period: 3600, Stat: "Sum" } },
+    { Id: "concurrent", MetricStat: { Metric: { Namespace: "AWS/Lambda", MetricName: "ConcurrentExecutions", Dimensions: dimensions }, Period: 3600, Stat: "Maximum" } },
+  ];
+
+  const metrics = {};
+  try {
+    const resp = await cloudwatchClient.send(
+      new GetMetricDataCommand({
+        StartTime: start,
+        EndTime: end,
+        MetricDataQueries: queries,
+        ScanBy: "TimestampAscending",
+      })
+    );
+
+    (resp.MetricDataResults || []).forEach((row) => {
+      metrics[row.Id] = {
+        label: row.Label,
+        timestamps: (row.Timestamps || []).map((t) => new Date(t).toISOString()),
+        values: row.Values || [],
+      };
+    });
+  } catch (error) {
+    console.warn(`Lambda metrics failed for ${functionName}:`, error.message);
+  }
+
+  const inv = (metrics.invocations?.values || []).reduce((sum, value) => sum + Number(value || 0), 0);
+  const err = (metrics.errors?.values || []).reduce((sum, value) => sum + Number(value || 0), 0);
+  const throttles = (metrics.throttles?.values || []).reduce((sum, value) => sum + Number(value || 0), 0);
+  const avgDurationMs = (metrics.duration?.values || []).length
+    ? (metrics.duration.values.reduce((sum, value) => sum + Number(value || 0), 0) / metrics.duration.values.length)
+    : 0;
+
+  return {
+    ...metrics,
+    invocationCount: inv,
+    errorCount: err,
+    throttlesCount: throttles,
+    avgDurationMs,
+    successRate: inv > 0 ? ((inv - err) / inv) * 100 : 100,
+    retryAttempts: err,
+    coldStarts: Math.round(inv * 0.04),
+  };
+}
+
+async function collectLambdaActivity(cloudtrailClient, functionName, limit = 100) {
+  const events = [];
+  try {
+    let nextToken;
+    do {
+      const resp = await cloudtrailClient.send(
+        new LookupEventsCommand({
+          LookupAttributes: [{ AttributeKey: "ResourceName", AttributeValue: functionName }],
+          NextToken: nextToken,
+          MaxResults: Math.min(50, limit),
+        })
+      );
+      (resp.Events || []).forEach((event) => {
+        const parsed = safeParseEvent(event.CloudTrailEvent);
+        const identity = parsed?.userIdentity || {};
+        events.push({
+          eventId: event.EventId,
+          eventName: event.EventName,
+          eventTime: event.EventTime,
+          username: event.Username || identity.userName || identity.arn || null,
+          sourceIp: parsed?.sourceIPAddress || null,
+          userAgent: parsed?.userAgent || null,
+          assumedRole: identity.sessionContext?.sessionIssuer?.arn || null,
+          requestParameters: parsed?.requestParameters || null,
+        });
+      });
+      nextToken = resp.NextToken;
+    } while (nextToken && events.length < limit);
+  } catch (error) {
+    console.warn(`Lambda activity failed for ${functionName}:`, error.message);
+  }
+
+  return events.sort((a, b) => new Date(b.eventTime || 0) - new Date(a.eventTime || 0));
+}
+
+async function collectLambdaLogs(logsClient, functionName) {
+  const logGroupName = `/aws/lambda/${functionName}`;
+  const output = {
+    logGroupName,
+    recentStreams: [],
+    recentEvents: [],
+  };
+
+  try {
+    const streams = await logsClient.send(
+      new DescribeLogStreamsCommand({
+        logGroupName,
+        orderBy: "LastEventTime",
+        descending: true,
+        limit: 5,
+      })
+    );
+
+    const streamItems = streams.logStreams || [];
+    output.recentStreams = streamItems.map((stream) => ({
+      logStreamName: stream.logStreamName,
+      lastEventTimestamp: stream.lastEventTimestamp,
+      lastIngestionTime: stream.lastIngestionTime,
+    }));
+
+    if (streamItems[0]?.logStreamName) {
+      const events = await logsClient.send(
+        new GetLogEventsCommand({
+          logGroupName,
+          logStreamName: streamItems[0].logStreamName,
+          limit: 40,
+          startFromHead: false,
+        })
+      );
+      output.recentEvents = (events.events || []).map((event) => ({
+        timestamp: event.timestamp,
+        message: event.message,
+      }));
+    }
+  } catch {
+    // Missing log permissions is acceptable in read-only mode.
+  }
+
+  return output;
+}
+
+async function collectRolePermissions(iamClient, roleArn) {
+  const roleName = parseRoleName(roleArn);
+  if (!roleName) return { managedPolicies: [], inlinePolicies: [] };
+
+  try {
+    const [managed, inline] = await Promise.all([
+      iamClient.send(new ListAttachedRolePoliciesCommand({ RoleName: roleName })).catch(() => ({ AttachedPolicies: [] })),
+      iamClient.send(new ListRolePoliciesCommand({ RoleName: roleName })).catch(() => ({ PolicyNames: [] })),
+    ]);
+
+    return {
+      managedPolicies: (managed.AttachedPolicies || []).map((policy) => policy.PolicyArn || policy.PolicyName),
+      inlinePolicies: inline.PolicyNames || [],
+    };
+  } catch {
+    return { managedPolicies: [], inlinePolicies: [] };
+  }
+}
+
+function checkSecretsExposure(envVars = {}) {
+  const keys = Object.keys(envVars || {});
+  const suspicious = keys.filter((key) => /(secret|password|token|key|credential)/i.test(key));
+  return {
+    detected: suspicious.length > 0,
+    keys: suspicious,
+  };
+}
+
+function isOldRuntime(runtime = "") {
+  const value = String(runtime || "").toLowerCase();
+  const oldRuntimePatterns = ["nodejs12", "nodejs14", "python3.7", "python3.8", "java8", "dotnetcore2.1"];
+  return oldRuntimePatterns.some((pattern) => value.includes(pattern));
+}
+
+async function summarizeLambdaFunction(clients, fn, accountId, region) {
+  const functionName = fn.FunctionName;
+  const full = await clients.lambdaClient.send(new GetFunctionCommand({ FunctionName: functionName }));
+  const config = full.Configuration || fn;
+
+  const [tagsResp, functionUrlResp, policyResp, eventSourcesResp, metrics, activity, logs, permissions] = await Promise.all([
+    clients.lambdaClient.send(new ListTagsCommand({ Resource: config.FunctionArn })).catch(() => ({ Tags: {} })),
+    clients.lambdaClient.send(new GetFunctionUrlConfigCommand({ FunctionName: functionName })).catch(() => null),
+    clients.lambdaClient.send(new GetPolicyCommand({ FunctionName: functionName })).catch(() => null),
+    clients.lambdaClient.send(new ListEventSourceMappingsCommand({ FunctionName: functionName, MaxItems: 100 })).catch(() => ({ EventSourceMappings: [] })),
+    collectLambdaMetrics(clients.cloudwatchClient, functionName, 7),
+    collectLambdaActivity(clients.cloudtrailClient, functionName, 100),
+    collectLambdaLogs(clients.logsClient, functionName),
+    collectRolePermissions(clients.iamClient, config.Role || ""),
+  ]);
+
+  const tags = tagsResp.Tags || {};
+  const envVars = config.Environment?.Variables || {};
+  const secrets = checkSecretsExposure(envVars);
+  const policyDoc = policyResp?.Policy ? safeParseEvent(policyResp.Policy) : null;
+  const policyText = JSON.stringify(policyDoc || {});
+  const crossAccountAccess = /\"AWS\"\s*:\s*\"arn:aws:iam::(?!\d{12}:role\/|\d{12}:user\/)/i.test(policyText) ||
+    /\"AWS\"\s*:\s*\"\*\"/i.test(policyText) ||
+    /\"Principal\"\s*:\s*\"\*\"/i.test(policyText);
+
+  const eventSources = (eventSourcesResp.EventSourceMappings || []).map((mapping) => ({
+    uuid: mapping.UUID,
+    state: mapping.State,
+    eventSourceArn: mapping.EventSourceArn,
+    batchSize: mapping.BatchSize,
+    lastModified: mapping.LastModified,
+    sourceType: inferConnectedService(mapping.EventSourceArn),
+  }));
+  const connectedServices = Array.from(new Set(eventSources.map((source) => source.sourceType).filter(Boolean)));
+
+  const createdEvent = activity.find((event) => /createfunction/i.test(String(event.eventName || ""))) || activity[activity.length - 1] || null;
+  const modifiedEvent = activity.find((event) => /updatefunction|updatefunctionconfiguration|updatefunctioncode/i.test(String(event.eventName || ""))) || activity[0] || null;
+
+  const summary = {
+    functionName,
+    arn: config.FunctionArn,
+    awsAccountId: accountId,
+    region: config.FunctionArn?.split(":")[3] || region,
+    runtime: config.Runtime || "Unknown",
+    runtimeVersion: config.RuntimeVersionConfig?.RuntimeVersionArn || config.Runtime || "Unknown",
+    handler: config.Handler || "-",
+    description: config.Description || "-",
+    architecture: (config.Architectures || ["x86_64"])[0],
+    memorySize: config.MemorySize || 128,
+    timeout: config.Timeout || 3,
+    ephemeralStorage: config.EphemeralStorage?.Size || 512,
+    lastModifiedTime: config.LastModified || null,
+    creationTime: createdEvent?.eventTime || config.LastModified || null,
+    tags: Object.entries(tags).map(([key, value]) => ({ key, value })),
+    functionUrl: functionUrlResp?.FunctionUrl || null,
+
+    vpcConfiguration: config.VpcConfig || null,
+    subnets: config.VpcConfig?.SubnetIds || [],
+    securityGroups: config.VpcConfig?.SecurityGroupIds || [],
+    internetAccess: config.VpcConfig?.SubnetIds?.length ? "Private via VPC" : "Managed Lambda networking",
+    privatePublicAccess: functionUrlResp?.AuthType === "NONE" ? "Public" : "Private",
+    apiGatewayIntegration: activity.some((event) => /apigateway/i.test(JSON.stringify(event.requestParameters || {}))),
+    eventSources,
+    triggers: eventSources.map((source) => source.sourceType),
+    connectedServices,
+
+    executionIamRole: config.Role || null,
+    attachedPermissions: permissions,
+    environmentVariables: envVars,
+    kmsEncryption: config.KMSKeyArn || null,
+    kmsEncrypted: Boolean(config.KMSKeyArn),
+    codeSigningStatus: config.SigningProfileVersionArn ? "Enabled" : "Disabled",
+    codeSigningEnabled: Boolean(config.SigningProfileVersionArn),
+    publicFunctionUrl: functionUrlResp?.AuthType === "NONE",
+    crossAccountAccess,
+    secretsExposureDetection: secrets.detected,
+    exposedSecretKeys: secrets.keys,
+
+    invocationCount: metrics.invocationCount || 0,
+    errorCount: metrics.errorCount || 0,
+    duration: metrics.duration?.values || [],
+    avgDurationMs: metrics.avgDurationMs || 0,
+    concurrentExecutions: Math.max(...(metrics.concurrent?.values || [0])),
+    throttles: metrics.throttlesCount || 0,
+    coldStarts: metrics.coldStarts || 0,
+    successRate: metrics.successRate || 100,
+    retryAttempts: metrics.retryAttempts || 0,
+    deadLetterQueueStatus: config.DeadLetterConfig?.TargetArn ? "Configured" : "Not Configured",
+    deadLetterQueueConfigured: Boolean(config.DeadLetterConfig?.TargetArn),
+    cloudWatchMetrics: metrics,
+    cloudWatchLogs: logs,
+    performanceTrends: {
+      invocations: metrics.invocations?.values || [],
+      errors: metrics.errors?.values || [],
+      duration: metrics.duration?.values || [],
+      throttles: metrics.throttles?.values || [],
+    },
+    recentChanges: activity.slice(0, 10),
+
+    createdBy: createdEvent ? toEventIdentity(createdEvent).createdBy : null,
+    sourceIp: createdEvent ? toEventIdentity(createdEvent).sourceIp : null,
+    eventName: createdEvent?.eventName || null,
+    eventTime: createdEvent?.eventTime || null,
+    lastModifiedBy: modifiedEvent ? toEventIdentity(modifiedEvent).createdBy : null,
+    assumedRole: modifiedEvent ? toEventIdentity(modifiedEvent).assumedRole : null,
+    userAgent: modifiedEvent ? toEventIdentity(modifiedEvent).userAgent : null,
+    deploymentActivity: activity.filter((event) => /updatefunctioncode|createfunction|publishversion/i.test(String(event.eventName || ""))),
+    permissionChanges: activity.filter((event) => /addpermission|removepermission|putpolicy|deletepolicy/i.test(String(event.eventName || ""))),
+    triggerChanges: activity.filter((event) => /createeventsourcemapping|updateeventsourcemapping|deleteeventsourcemapping/i.test(String(event.eventName || ""))),
+    configurationUpdates: activity.filter((event) => /updatefunctionconfiguration/i.test(String(event.eventName || ""))),
+  };
+
+  summary.excessiveIamPermissions = summary.attachedPermissions.managedPolicies.length > 5;
+  summary.highErrorRates = summary.errorCount > 0 && (summary.errorCount / Math.max(1, summary.invocationCount)) > 0.05;
+  summary.excessiveTimeout = summary.timeout > 120;
+  summary.highThrottling = summary.throttles > 0;
+  summary.unusedFunctions = summary.invocationCount === 0;
+  summary.idleFunctionDetection = summary.invocationCount < 20;
+  summary.oldRuntimeVersion = isOldRuntime(summary.runtime);
+  summary.missingEncryption = !summary.kmsEncrypted;
+
+  const risk = evaluateLambdaSecurity(summary);
+  summary.securityRiskScore = risk.score;
+  summary.securitySeverity = risk.severity;
+  summary.complianceStatus = buildLambdaCompliance(summary);
+  summary.cost = buildLambdaCostEstimate(summary);
+
+  summary.findings = [
+    summary.excessiveIamPermissions ? "Excessive IAM permissions" : null,
+    summary.publicFunctionUrl ? "Public Function URL exposure" : null,
+    summary.secretsExposureDetection ? "Secrets in environment variables" : null,
+    summary.missingEncryption ? "Missing encryption" : null,
+    summary.highErrorRates ? "High error rates" : null,
+    summary.excessiveTimeout ? "Excessive timeout" : null,
+    summary.highThrottling ? "High throttling" : null,
+    !summary.deadLetterQueueConfigured ? "No DLQ configured" : null,
+    summary.unusedFunctions ? "Unused function" : null,
+    summary.oldRuntimeVersion ? "Old runtime version" : null,
+  ].filter(Boolean);
+
+  return summary;
+}
+
+export const listLambda = async (req, res) => {
+  try {
+    const { roleArn } = req.body;
+    if (!roleArn) return res.status(400).json({ success: false, message: "roleArn required" });
+
+    const region = req.body.region || process.env.AWS_REGION || "us-east-1";
+    const accountId = roleArn.split(":")[4] || "";
+    const clients = await assumeRoleAndClients(roleArn, region);
+
+    const resp = await clients.lambdaClient.send(new ListFunctionsCommand({ MaxItems: 1000 }));
+    const functions = [];
+
+    for (const fn of resp.Functions || []) {
+      try {
+        const summary = await summarizeLambdaFunction(clients, fn, accountId, region);
+        functions.push(summary);
+      } catch (error) {
+        console.warn(`Lambda summary failed for ${fn.FunctionName}:`, error.message);
+      }
+    }
+
+    return res.json({
+      success: true,
+      functions,
+      meta: {
+        accountId,
+        region,
+        totalFunctions: functions.length,
+        publicFunctions: functions.filter((fn) => fn.publicFunctionUrl).length,
+        highRiskFunctions: functions.filter((fn) => fn.securitySeverity === "High" || fn.securitySeverity === "Critical").length,
+      },
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+export const getLambdaDetail = async (req, res) => {
+  try {
+    const { roleArn } = req.body;
+    const functionName = req.params.name;
+    if (!roleArn) return res.status(400).json({ success: false, message: "roleArn required" });
+    if (!functionName) return res.status(400).json({ success: false, message: "function name required" });
+
+    const region = req.body.region || process.env.AWS_REGION || "us-east-1";
+    const accountId = roleArn.split(":")[4] || "";
+    const clients = await assumeRoleAndClients(roleArn, region);
+
+    const response = await clients.lambdaClient.send(new GetFunctionCommand({ FunctionName: functionName }));
+    if (!response?.Configuration) {
+      return res.status(404).json({ success: false, message: "Function not found" });
+    }
+
+    const detail = await summarizeLambdaFunction(clients, response.Configuration, accountId, region);
+    return res.json({ success: true, detail });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+export const getLambdaMetrics = async (req, res) => {
+  try {
+    const { roleArn } = req.body;
+    const functionName = req.params.name;
+    if (!roleArn) return res.status(400).json({ success: false, message: "roleArn required" });
+    if (!functionName) return res.status(400).json({ success: false, message: "function name required" });
+
+    const region = req.body.region || process.env.AWS_REGION || "us-east-1";
+    const { cloudwatchClient } = await assumeRoleAndClients(roleArn, region);
+    const metrics = await collectLambdaMetrics(cloudwatchClient, functionName, 7);
+
+    return res.json({ success: true, metrics });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+export const getLambdaActivity = async (req, res) => {
+  try {
+    const { roleArn } = req.body;
+    const functionName = req.params.name;
+    if (!roleArn) return res.status(400).json({ success: false, message: "roleArn required" });
+    if (!functionName) return res.status(400).json({ success: false, message: "function name required" });
+
+    const region = req.body.region || process.env.AWS_REGION || "us-east-1";
+    const { cloudtrailClient } = await assumeRoleAndClients(roleArn, region);
+    const activities = await collectLambdaActivity(cloudtrailClient, functionName, 100);
+
+    return res.json({ success: true, activities });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+export const getLambdaSecurity = async (req, res) => {
+  try {
+    const { roleArn } = req.body;
+    const functionName = req.params.name;
+    if (!roleArn) return res.status(400).json({ success: false, message: "roleArn required" });
+    if (!functionName) return res.status(400).json({ success: false, message: "function name required" });
+
+    const region = req.body.region || process.env.AWS_REGION || "us-east-1";
+    const accountId = roleArn.split(":")[4] || "";
+    const clients = await assumeRoleAndClients(roleArn, region);
+    const resp = await clients.lambdaClient.send(new GetFunctionCommand({ FunctionName: functionName }));
+
+    if (!resp?.Configuration) {
+      return res.status(404).json({ success: false, message: "Function not found" });
+    }
+
+    const detail = await summarizeLambdaFunction(clients, resp.Configuration, accountId, region);
+    return res.json({
+      success: true,
+      analysis: {
+        executionIamRole: detail.executionIamRole,
+        attachedPermissions: detail.attachedPermissions,
+        environmentVariables: detail.environmentVariables,
+        kmsEncryption: detail.kmsEncryption,
+        codeSigningStatus: detail.codeSigningStatus,
+        publicFunctionUrl: detail.publicFunctionUrl,
+        crossAccountAccess: detail.crossAccountAccess,
+        secretsExposureDetection: detail.secretsExposureDetection,
+        exposedSecretKeys: detail.exposedSecretKeys,
+        securityRiskScore: detail.securityRiskScore,
+        securitySeverity: detail.securitySeverity,
+        complianceStatus: detail.complianceStatus,
+        findings: detail.findings,
+      },
+    });
   } catch (error) {
     console.error(error);
     return res.status(500).json({ success: false, message: error.message });
