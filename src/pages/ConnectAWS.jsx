@@ -2,7 +2,6 @@ import { ShieldCheck } from "lucide-react";
 import axios from "axios";
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import Sidebar from "../components/Sidebar";
 
 export default function ConnectAWS() {
   const [roleArn, setRoleArn] = useState("");
@@ -15,16 +14,18 @@ export default function ConnectAWS() {
       setLoading(true);
 
       const response = await axios.post(
-        "/api/aws/connect",
+        "http://localhost:5000/api/aws/connect",
         { roleArn }
       );
 
+      // ✅ Save Role ARN before navigating
       localStorage.setItem("roleArn", roleArn);
-      localStorage.setItem("awsUsers", JSON.stringify(response.data.users || []));
-      localStorage.setItem("awsResources", JSON.stringify(response.data.resources || []));
-      localStorage.setItem("resourcesByUser", JSON.stringify(response.data.resourcesByUser || {}));
-      localStorage.setItem("awsMetrics", JSON.stringify(response.data.metrics || {}));
+
+      // ✅ Save discovered users
+      localStorage.setItem("awsUsers", JSON.stringify(response.data.users));
+      localStorage.setItem("awsEc2Instances", JSON.stringify(response.data.ec2Instances || []));
       localStorage.setItem("awsAccount", JSON.stringify(response.data.account || {}));
+      localStorage.setItem("awsMetrics", JSON.stringify(response.data.metrics || {}));
 
       navigate("/dashboard");
     } catch (error) {
@@ -37,68 +38,65 @@ export default function ConnectAWS() {
 
   return (
     <div className="min-h-screen bg-slate-950 text-white flex">
-      <Sidebar />
+      {/* Sidebar */}
+      <div className="w-64 bg-slate-900 p-6 border-r border-slate-800">
+        <h1 className="text-2xl font-bold text-blue-400">AWS Scanner</h1>
+        <div className="mt-10 space-y-4">
+          <button className="w-full bg-blue-600 py-3 rounded-xl">Get Started</button>
+          <button className="w-full bg-slate-800 py-3 rounded-xl">Dashboard</button>
+        </div>
+      </div>
 
+      {/* Main Content */}
       <div className="flex-1 p-10">
-        <div className="max-w-6xl mx-auto">
-          <h1 className="text-4xl font-bold">Welcome to AWS Scanner</h1>
-          <p className="text-slate-400 mt-3">To get started, create an IAM role and provide the Role ARN.</p>
+        <div className="max-w-5xl mx-auto">
+          <h1 className="text-4xl font-bold">Connect Your AWS Account</h1>
+          <p className="text-slate-400 mt-3">
+            Create a read-only IAM role and provide the ARN.
+          </p>
 
-          <div className="grid grid-cols-12 gap-6 mt-8">
-            <div className="col-span-7 bg-slate-900 p-6 rounded-2xl border border-slate-800">
-              <h3 className="font-semibold text-lg">Step 1: Create IAM Role</h3>
-              <ol className="mt-4 list-decimal list-inside text-slate-300 space-y-2">
-                <li>Open the IAM console and create a new role.</li>
-                <li>Trusted entity: AWS account — use Account ID shown in sidebar.</li>
-                <li>Attach ReadOnlyAccess managed policy.</li>
-                <li>Copy the Role ARN from the role summary.</li>
-              </ol>
-
-              <div className="mt-6 bg-yellow-50/10 p-4 rounded text-sm text-yellow-200">Security note: This role uses read-only permissions and will not make changes to your account.</div>
+          {/* Steps */}
+          <div className="grid grid-cols-3 gap-6 mt-10">
+            <div className="bg-slate-900 p-6 rounded-2xl border border-slate-800">
+              <div className="bg-blue-600 w-10 h-10 rounded-full flex items-center justify-center">1</div>
+              <h2 className="text-xl font-semibold mt-4">Create IAM Role</h2>
+              <p className="text-slate-400 mt-2">Create a cross-account read-only role.</p>
             </div>
 
-            <div className="col-span-5 bg-slate-900 p-6 rounded-2xl border border-slate-800">
-              <div className="flex items-center gap-3">
-                <ShieldCheck className="text-blue-400" />
-                <h3 className="font-semibold text-lg">Provide Role ARN</h3>
-              </div>
+            <div className="bg-slate-900 p-6 rounded-2xl border border-slate-800">
+              <div className="bg-blue-600 w-10 h-10 rounded-full flex items-center justify-center">2</div>
+              <h2 className="text-xl font-semibold mt-4">Provide ARN</h2>
+              <p className="text-slate-400 mt-2">Paste the IAM Role ARN here.</p>
+            </div>
 
-              <input
-                type="text"
-                value={roleArn}
-                onChange={(e) => setRoleArn(e.target.value)}
-                placeholder="arn:aws:iam::123456789012:role/AWSScannerReadOnlyRole"
-                className="w-full mt-6 bg-slate-950 border border-slate-700 rounded-xl p-4 outline-none"
-              />
-
-              <div className="mt-3 text-slate-400 text-sm bg-slate-800 p-3 rounded">Example: arn:aws:iam::123456789012:role/AWSScannerReadOnlyRole</div>
-
-              <button
-                onClick={connectAWS}
-                className="mt-6 w-full bg-blue-600 hover:bg-blue-700 px-6 py-3 rounded-xl font-semibold"
-              >
-                {loading ? "Connecting..." : "Connect to AWS"}
-              </button>
+            <div className="bg-slate-900 p-6 rounded-2xl border border-slate-800">
+              <div className="bg-blue-600 w-10 h-10 rounded-full flex items-center justify-center">3</div>
+              <h2 className="text-xl font-semibold mt-4">Start Scan</h2>
+              <p className="text-slate-400 mt-2">Scan users and AWS resources.</p>
             </div>
           </div>
 
-          <div className="grid grid-cols-4 gap-4 mt-8">
-            <div className="col-span-1 bg-slate-900 p-4 rounded-2xl border border-slate-800 text-center">
-              <div className="text-lg font-semibold">Scan Users</div>
-              <div className="text-sm text-slate-400 mt-2">Discover IAM users</div>
+          {/* ARN Input */}
+          <div className="bg-slate-900 mt-10 p-8 rounded-2xl border border-slate-800">
+            <div className="flex items-center gap-3">
+              <ShieldCheck className="text-blue-400" />
+              <h2 className="text-2xl font-semibold">AWS Role ARN</h2>
             </div>
-            <div className="col-span-1 bg-slate-900 p-4 rounded-2xl border border-slate-800 text-center">
-              <div className="text-lg font-semibold">Scan Resources</div>
-              <div className="text-sm text-slate-400 mt-2">Find resources per user</div>
-            </div>
-            <div className="col-span-1 bg-slate-900 p-4 rounded-2xl border border-slate-800 text-center">
-              <div className="text-lg font-semibold">Organize</div>
-              <div className="text-sm text-slate-400 mt-2">Analyze by user</div>
-            </div>
-            <div className="col-span-1 bg-slate-900 p-4 rounded-2xl border border-slate-800 text-center">
-              <div className="text-lg font-semibold">Maintain</div>
-              <div className="text-sm text-slate-400 mt-2">Read-only access</div>
-            </div>
+
+            <input
+              type="text"
+              value={roleArn}
+              onChange={(e) => setRoleArn(e.target.value)}
+              placeholder="arn:aws:iam::123456789012:role/AWSScannerRole"
+              className="w-full mt-6 bg-slate-950 border border-slate-700 rounded-xl p-4 outline-none"
+            />
+
+            <button
+              onClick={connectAWS}
+              className="mt-6 bg-blue-600 hover:bg-blue-700 px-8 py-4 rounded-xl font-semibold"
+            >
+              {loading ? "Connecting..." : "Connect AWS"}
+            </button>
           </div>
         </div>
       </div>

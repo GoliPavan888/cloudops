@@ -1,56 +1,62 @@
-import React from "react";
-import { Home, Users, Box, Clock, Settings, LogOut } from "lucide-react";
-import { Link, useLocation } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
+import { LayoutDashboard, Server, Database, Cloud, Brain, ShieldCheck, FileText, Boxes, Layers3 } from "lucide-react";
 
-export default function Sidebar() {
-  const location = useLocation();
+const sections = [
+	{ key: "dashboard", label: "Dashboard", icon: LayoutDashboard, path: "/dashboard" },
+	{ key: "ec2", label: "EC2 Instances", icon: Server, path: "/ec2" },
+	{ key: "s3", label: "S3 Buckets", icon: Cloud, path: "/s3" },
+	{ key: "rds", label: "RDS Databases", icon: Database, path: "/rds" },
+	{ key: "lambda", label: "Lambda Functions", icon: Brain, path: "/dashboard" },
+	{ key: "iam", label: "IAM", icon: ShieldCheck, path: "/dashboard" },
+	{ key: "logs", label: "CloudWatch Logs", icon: FileText, path: "/dashboard" },
+	{ key: "dynamo", label: "DynamoDB", icon: Boxes, path: "/dashboard" },
+	{ key: "sqs", label: "SQS Queues", icon: Layers3, path: "/dashboard" }
+];
 
-  const nav = [
-    { to: "/", label: "Dashboard", icon: Home },
-    { to: "/users", label: "Users", icon: Users },
-    { to: "/resources", label: "Resources", icon: Box },
-    { to: "/history", label: "Scan History", icon: Clock },
-    { to: "/settings", label: "Settings", icon: Settings },
-  ];
+export default function Sidebar({ active = "dashboard", accountId, region }) {
+	const navigate = useNavigate();
+	const location = useLocation();
 
-  return (
-    <aside className="w-64 bg-slate-900 p-6 border-r border-slate-800 min-h-screen flex flex-col justify-between">
-      <div>
-        <h1 className="text-2xl font-bold text-blue-400">AWS Scanner</h1>
+	const activeKey = active === "dashboard" && location.pathname.includes("/ec2") ? "ec2" : active;
 
-        <nav className="mt-10 space-y-2">
-          {nav.map((n) => {
-            const Icon = n.icon;
-            const active = location.pathname === n.to;
-            return (
-              <Link
-                key={n.to}
-                to={n.to}
-                className={`flex items-center gap-3 p-3 rounded-lg hover:bg-slate-800 transition ${
-                  active ? "bg-slate-800" : ""
-                }`}
-              >
-                <Icon className="w-5 h-5 text-slate-300" />
-                <span className="text-slate-100">{n.label}</span>
-              </Link>
-            );
-          })}
-        </nav>
-      </div>
+	return (
+		<aside className="w-[260px] border-r border-slate-800 bg-[#0a1225] p-5">
+			<div className="flex items-center gap-3 border-b border-slate-800 pb-4">
+				<div className="h-10 w-10 rounded-xl bg-indigo-500/90 text-white font-bold grid place-items-center">CS</div>
+				<div>
+					<h2 className="text-lg font-semibold">Console Sensei</h2>
+					<p className="text-xs text-slate-400">Cloud Ops</p>
+				</div>
+			</div>
 
-      <div className="text-slate-300">
-        <div className="bg-slate-800 p-4 rounded-lg mb-4">
-          <div className="text-xs text-slate-400">Connected Account</div>
-          <div className="font-medium mt-2">Account: 123456789012</div>
-          <div className="text-xs text-slate-400">Region: us-east-1</div>
-          <div className="text-xs text-green-400 mt-2">● Connected</div>
-        </div>
+			<div className="mt-5 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm">
+				{accountId || "AWS Account"}
+			</div>
 
-        <div className="flex items-center gap-2">
-          <LogOut className="w-4 h-4" />
-          <button className="text-sm text-slate-300">Log out</button>
-        </div>
-      </div>
-    </aside>
-  );
+			<nav className="mt-6 space-y-2">
+				{sections.map((item) => {
+					const Icon = item.icon;
+					const isActive = activeKey === item.key;
+					return (
+						<button
+							key={item.key}
+							onClick={() => navigate(item.path)}
+							className={`w-full flex items-center gap-3 rounded-lg px-3 py-2 text-left transition ${
+								isActive ? "bg-indigo-600/20 text-indigo-300" : "text-slate-300 hover:bg-slate-900"
+							}`}
+						>
+							<Icon className="h-4 w-4" />
+							<span>{item.label}</span>
+						</button>
+					);
+				})}
+			</nav>
+
+			<div className="mt-10 rounded-xl border border-slate-800 bg-[#0b152d] p-3">
+				<p className="text-xs text-slate-400">Region</p>
+				<p className="mt-1 font-medium">{region || "us-east-1"}</p>
+				<p className="mt-3 text-xs text-emerald-400">Connected</p>
+			</div>
+		</aside>
+	);
 }

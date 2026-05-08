@@ -13,6 +13,8 @@ import {
   Zap,
   KeyRound,
 } from "lucide-react";
+import { useNavigate } from "react-router-dom";
+import Sidebar from "../components/Sidebar";
 
 function formatMoney(value) {
   return new Intl.NumberFormat("en-US", {
@@ -148,19 +150,24 @@ function FindingsDonut({ findings }) {
   );
 }
 
-function MetricCard({ icon: Icon, label, value }) {
+function MetricCard({ icon: Icon, label, value, onClick }) {
   return (
-    <div className="rounded-2xl border border-slate-800 bg-slate-900 p-4">
+    <button
+      type="button"
+      onClick={onClick}
+      className="rounded-2xl border border-slate-800 bg-slate-900 p-4 text-left transition hover:border-indigo-500/50 hover:bg-slate-900/80"
+    >
       <div className="inline-flex rounded-lg bg-slate-800 p-2">
         <Icon className="h-5 w-5 text-sky-400" />
       </div>
       <p className="mt-3 text-sm text-slate-400">{label}</p>
       <p className="mt-1 text-3xl font-bold text-slate-100">{value}</p>
-    </div>
+    </button>
   );
 }
 
 export default function Dashboard() {
+  const navigate = useNavigate();
   const [users, setUsers] = useState([]);
   const [resources, setResources] = useState([]);
   const [metrics, setMetrics] = useState({
@@ -191,38 +198,7 @@ export default function Dashboard() {
   return (
     <div className="min-h-screen bg-[#070d1d] text-slate-100">
       <div className="flex min-h-screen">
-        <aside className="w-[260px] border-r border-slate-800 bg-[#0a1225] p-5">
-          <div className="flex items-center gap-3 border-b border-slate-800 pb-4">
-            <div className="h-10 w-10 rounded-xl bg-indigo-500/90 text-white font-bold grid place-items-center">CS</div>
-            <div>
-              <h2 className="text-lg font-semibold">Console Sensei</h2>
-              <p className="text-xs text-slate-400">Cloud Ops</p>
-            </div>
-          </div>
-
-          <div className="mt-5 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm">{account.accountId || "AWS Account"}</div>
-
-          <nav className="mt-6 space-y-2">
-            <div className="rounded-lg bg-indigo-600/20 px-3 py-2 text-indigo-300">Dashboard</div>
-            <div className="px-3 py-2 text-slate-300">AWS Resources</div>
-            <div className="pl-7 text-slate-400 space-y-2 text-sm">
-              <div>EC2 Instances</div>
-              <div>S3 Buckets</div>
-              <div>RDS Databases</div>
-              <div>Lambda Functions</div>
-              <div>IAM</div>
-              <div>CloudWatch Logs</div>
-              <div>DynamoDB</div>
-              <div>SQS Queues</div>
-            </div>
-          </nav>
-
-          <div className="mt-10 rounded-xl border border-slate-800 bg-[#0b152d] p-3">
-            <p className="text-xs text-slate-400">Region</p>
-            <p className="mt-1 font-medium">{account.region || "us-east-1"}</p>
-            <p className="mt-3 text-xs text-emerald-400">Connected</p>
-          </div>
-        </aside>
+        <Sidebar active="dashboard" accountId={account.accountId} region={account.region} />
 
         <main className="flex-1 px-7 py-5">
           <header className="flex items-center justify-between gap-4 border-b border-slate-800 pb-4">
@@ -268,9 +244,9 @@ export default function Dashboard() {
                 }
               />
               <MetricCard icon={Globe2} label="Active Regions" value={metrics.activeRegions || 0} />
-              <MetricCard icon={Box} label="S3 Buckets" value={serviceBreakdown.S3 || 0} />
-              <MetricCard icon={Server} label="EC2 Instances" value={serviceBreakdown.EC2 || 0} />
-              <MetricCard icon={Zap} label="Lambda Functions" value={serviceBreakdown.Lambda || 0} />
+              <MetricCard icon={Box} label="S3 Buckets" value={serviceBreakdown.S3 || 0} onClick={() => navigate("/s3")} />
+              <MetricCard icon={Server} label="EC2 Instances" value={serviceBreakdown.EC2 || 0} onClick={() => navigate("/ec2")} />
+              <MetricCard icon={Database} label="RDS Databases" value={serviceBreakdown.RDS || 0} onClick={() => navigate("/rds")} />
             </div>
           </section>
 
