@@ -7,6 +7,9 @@ import RDSInventory from "./pages/RDSInventory";
 import LambdaInventory from "./pages/LambdaInventory";
 import IAMInventory from "./pages/IAMInventory";
 import UserDetails from "./pages/UserDetails";
+import CloudWatchLogs from "./pages/CloudWatchLogs";
+import DynamoDBInventory from "./pages/DynamoDBInventory";
+import SQSInventory from "./pages/SQSInventory";
 
 function App() {
   return (
@@ -19,6 +22,9 @@ function App() {
         <Route path="/rds" element={<RDSInventory />} />
         <Route path="/lambda" element={<LambdaInventory />} />
         <Route path="/iam" element={<IAMInventory />} />
+        <Route path="/logs" element={<CloudWatchLogs />} />
+        <Route path="/dynamodb" element={<DynamoDBInventory />} />
+        <Route path="/sqs" element={<SQSInventory />} />
         <Route path="/user/:username" element={<UserDetails />} />
       </Routes>
     </BrowserRouter>

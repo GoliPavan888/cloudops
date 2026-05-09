@@ -20,6 +20,7 @@ import {
 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import Sidebar from "../components/Sidebar";
+import { useAWSConnection } from "../context/AWSConnectionContext.jsx";
 
 function formatDate(value) {
   if (!value) return "-";
@@ -116,6 +117,9 @@ function SummaryCard({ label, value, accent, icon: Icon }) {
 
 export default function IAMInventory() {
   const navigate = useNavigate();
+  const { connectedRole } = useAWSConnection();
+  const account = connectedRole || {};
+  const roleArn = account.roleArn || "";
   const [users, setUsers] = useState([]);
   const [groups, setGroups] = useState([]);
   const [roles, setRoles] = useState([]);
@@ -138,13 +142,9 @@ export default function IAMInventory() {
   const [activeTab, setActiveTab] = useState("General");
   const [loading, setLoading] = useState(false);
 
-  const account = JSON.parse(localStorage.getItem("awsAccount") || "{}");
-  const roleArn = localStorage.getItem("roleArn") || account.roleArn;
-
   useEffect(() => {
     if (roleArn) fetchIam();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roleArn]);
+  }, [roleArn, account.region]);
 
   useEffect(() => {
     if (!selected || selected.entityType !== "User") return;
@@ -326,6 +326,20 @@ export default function IAMInventory() {
   const regionOptions = Array.from(new Set(inventory.map((item) => item.region).filter(Boolean))).sort();
 
   const selectedUser = selectedItem?.entityType === "User" ? (detail || selectedItem?.raw || null) : null;
+
+  if (!connectedRole) {
+    return (
+      <div className="min-h-screen bg-slate-950 text-white grid place-items-center p-6">
+        <div className="max-w-md rounded-2xl border border-slate-800 bg-slate-900 p-8 text-center">
+          <h1 className="text-2xl font-bold">No AWS account connected</h1>
+          <p className="mt-2 text-sm text-slate-400">Reconnect AWS account to view IAM inventory.</p>
+          <button onClick={() => navigate("/")} className="mt-6 rounded-xl bg-indigo-500 px-5 py-3 text-sm font-semibold text-white transition hover:bg-indigo-400">
+            Reconnect AWS account
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-[#070d1d] text-slate-100">

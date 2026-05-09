@@ -26,6 +26,13 @@ import {
 	getIAMUserMetrics,
 	getIAMUserActivity,
 	getIAMUserSecurity,
+	getCost,
+	listCloudWatchLogs,
+	getCloudWatchLogDetail,
+	listDynamoDB,
+	getDynamoDBDetail,
+	listSQS,
+	getSQSDetail,
 } from "../services/awsService.js";
 
 const router = express.Router();
@@ -67,5 +74,20 @@ router.post("/iam/:userName", getIAMUserDetail);
 router.post("/iam/:userName/metrics", getIAMUserMetrics);
 router.post("/iam/:userName/activity", getIAMUserActivity);
 router.post("/iam/:userName/security", getIAMUserSecurity);
+
+// Cost & Billing APIs
+router.post("/cost", getCost);
+
+// CloudWatch Logs APIs
+router.post("/logs", listCloudWatchLogs);
+router.post("/logs/:logGroupName", getCloudWatchLogDetail);
+
+// DynamoDB APIs
+router.post("/dynamodb", listDynamoDB);
+router.post("/dynamodb/:tableName", getDynamoDBDetail);
+
+// SQS APIs
+router.post("/sqs", listSQS);
+router.post("/sqs/:queueName", getSQSDetail);
 
 export default router;

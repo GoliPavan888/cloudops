@@ -7,29 +7,36 @@ import {
   useEffect,
   useState,
 } from "react";
+import { useAWSConnection } from "../context/AWSConnectionContext.jsx";
 
 export default function UserDetails() {
 
   const { username } = useParams();
+  const { connectedRole } = useAWSConnection();
 
   const [data, setData] =
     useState(null);
 
   useEffect(() => {
 
+    if (!connectedRole?.roleArn) {
+      return;
+    }
+
     fetchResources();
 
-  }, []);
+  }, [connectedRole?.roleArn, username]);
 
   const fetchResources =
     async () => {
 
     try {
 
-      const roleArn =
-        localStorage.getItem(
-          "roleArn"
-        );
+      const roleArn = connectedRole?.roleArn;
+
+      if (!roleArn) {
+        return;
+      }
 
       const response =
         await axios.post(
@@ -47,6 +54,17 @@ export default function UserDetails() {
       console.error(error);
     }
   };
+
+  if (!connectedRole) {
+    return (
+      <div className="min-h-screen bg-slate-950 text-white grid place-items-center p-6">
+        <div className="max-w-md rounded-2xl border border-slate-800 bg-slate-900 p-8 text-center">
+          <h1 className="text-2xl font-bold">No AWS account connected</h1>
+          <p className="mt-2 text-sm text-slate-400">Reconnect AWS account to view user resources.</p>
+        </div>
+      </div>
+    );
+  }
 
   if (!data) {
     return (

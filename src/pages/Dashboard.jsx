@@ -13,9 +13,11 @@ import {
   Zap,
   Brain,
   KeyRound,
+  Layers3,
 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import Sidebar from "../components/Sidebar";
+import { useAWSConnection } from "../context/AWSConnectionContext.jsx";
 
 function formatMoney(value) {
   return new Intl.NumberFormat("en-US", {
@@ -169,6 +171,7 @@ function MetricCard({ icon: Icon, label, value, onClick }) {
 
 export default function Dashboard() {
   const navigate = useNavigate();
+  const { connectedRole } = useAWSConnection();
   const [users, setUsers] = useState([]);
   const [resources, setResources] = useState([]);
   const [metrics, setMetrics] = useState({
@@ -179,13 +182,16 @@ export default function Dashboard() {
     costTrend: [],
     securityFindings: { critical: 0, high: 0, medium: 0, low: 0, informational: 0 },
   });
-  const [account, setAccount] = useState({});
+  const account = connectedRole || {};
+  const accountLabel = account.accountAlias || account.accountId || "AWS Account";
+  const environmentType = account.environmentType || "Development";
+  const connectionHealth = account.connectionHealth || "Connected";
+  const roleName = account.roleName || "UnknownRole";
 
   useEffect(() => {
     setUsers(JSON.parse(localStorage.getItem("awsUsers") || "[]"));
     setResources(JSON.parse(localStorage.getItem("awsResources") || "[]"));
     setMetrics(JSON.parse(localStorage.getItem("awsMetrics") || "{}"));
-    setAccount(JSON.parse(localStorage.getItem("awsAccount") || "{}"));
   }, []);
 
   const costSeries = metrics.costTrend || [];
@@ -195,6 +201,20 @@ export default function Dashboard() {
   const resourceRows = Object.entries(serviceBreakdown)
     .sort((a, b) => b[1] - a[1])
     .map(([service, count]) => ({ service, count }));
+
+  if (!connectedRole) {
+    return (
+      <div className="min-h-screen bg-[#070d1d] text-slate-100 grid place-items-center p-6">
+        <div className="max-w-md rounded-2xl border border-slate-800 bg-slate-900 p-8 text-center shadow-2xl shadow-slate-950/30">
+          <h1 className="text-2xl font-bold text-white">No AWS account connected</h1>
+          <p className="mt-2 text-sm text-slate-400">Reconnect your AWS account to view the dashboard and inventory pages.</p>
+          <button onClick={() => navigate("/")} className="mt-6 rounded-xl bg-indigo-500 px-5 py-3 text-sm font-semibold text-white transition hover:bg-indigo-400">
+            Reconnect AWS account
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-[#070d1d] text-slate-100">
@@ -215,7 +235,15 @@ export default function Dashboard() {
             <div className="flex items-center gap-3 text-sm">
               <span className="text-emerald-400">AWS</span>
               <span className="text-slate-500">|</span>
-              <span className="text-slate-300">prod-main</span>
+              <span className="text-slate-200">{accountLabel}</span>
+              <span className="rounded-full border border-sky-500/30 bg-sky-500/10 px-2.5 py-1 text-[11px] font-semibold text-sky-200">
+                {environmentType}
+              </span>
+              <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-semibold text-emerald-200">
+                {connectionHealth}
+              </span>
+              <span className="text-slate-500">|</span>
+              <span className="text-slate-400">{account.region || "us-east-1"}</span>
               <button className="rounded-full bg-slate-900 p-2 border border-slate-700">
                 <Bell className="h-4 w-4" />
               </button>
@@ -224,6 +252,13 @@ export default function Dashboard() {
               </button>
             </div>
           </header>
+
+          <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-slate-400">
+            <span className="rounded-full border border-slate-700 bg-slate-900 px-2.5 py-1">Role: {roleName}</span>
+            <span className="rounded-full border border-slate-700 bg-slate-900 px-2.5 py-1">
+              Assumed role: {account.assumedRoleArn || account.roleArn || "-"}
+            </span>
+          </div>
 
           <section className="mt-6">
             <h1 className="text-4xl font-bold tracking-tight">Operations Dashboard</h1>
@@ -249,6 +284,7 @@ export default function Dashboard() {
               <MetricCard icon={Server} label="EC2 Instances" value={serviceBreakdown.EC2 || 0} onClick={() => navigate("/ec2")} />
               <MetricCard icon={Database} label="RDS Databases" value={serviceBreakdown.RDS || 0} onClick={() => navigate("/rds")} />
               <MetricCard icon={Brain} label="Lambda Functions" value={serviceBreakdown.Lambda || 0} onClick={() => navigate("/lambda")} />
+              <MetricCard icon={Layers3} label="SQS Queues" value={serviceBreakdown.SQS || 0} onClick={() => navigate("/sqs")} />
             </div>
           </section>
 

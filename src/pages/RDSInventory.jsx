@@ -18,6 +18,7 @@ import {
 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import Sidebar from "../components/Sidebar";
+import { useAWSConnection } from "../context/AWSConnectionContext.jsx";
 
 function formatDate(value) {
   if (!value) return "-";
@@ -123,6 +124,9 @@ function SummaryCard({ label, value, accent }) {
 
 export default function RDSInventory() {
   const navigate = useNavigate();
+  const { connectedRole } = useAWSConnection();
+  const account = connectedRole || {};
+  const roleArn = account.roleArn || "";
   const [databases, setDatabases] = useState([]);
   const [selected, setSelected] = useState(null);
   const [detail, setDetail] = useState(null);
@@ -142,13 +146,9 @@ export default function RDSInventory() {
   const [activeTab, setActiveTab] = useState("General");
   const [loading, setLoading] = useState(false);
 
-  const account = JSON.parse(localStorage.getItem("awsAccount") || "{}");
-  const roleArn = localStorage.getItem("roleArn") || account.roleArn;
-
   useEffect(() => {
     if (roleArn) fetchDatabases();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roleArn]);
+  }, [roleArn, account.region]);
 
   useEffect(() => {
     if (!selected) return;
@@ -280,6 +280,20 @@ export default function RDSInventory() {
   const detections = detail?.detections || [];
   const complianceViolations = detail?.complianceStatus?.violations || [];
   const cost = detail?.cost || null;
+
+  if (!connectedRole) {
+    return (
+      <div className="min-h-screen bg-slate-950 text-white grid place-items-center p-6">
+        <div className="max-w-md rounded-2xl border border-slate-800 bg-slate-900 p-8 text-center">
+          <h1 className="text-2xl font-bold">No AWS account connected</h1>
+          <p className="mt-2 text-sm text-slate-400">Reconnect AWS account to view RDS inventory.</p>
+          <button onClick={() => navigate("/")} className="mt-6 rounded-xl bg-indigo-500 px-5 py-3 text-sm font-semibold text-white transition hover:bg-indigo-400">
+            Reconnect AWS account
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-[#070d1d] text-slate-100">

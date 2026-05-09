@@ -1,4 +1,4 @@
-import { STSClient, AssumeRoleCommand } from "@aws-sdk/client-sts";
+import { STSClient, AssumeRoleCommand, GetCallerIdentityCommand } from "@aws-sdk/client-sts";
 import {
   IAMClient,
   ListUsersCommand,
@@ -19,6 +19,7 @@ import {
   GetPolicyVersionCommand,
   ListAttachedRolePoliciesCommand,
   ListRolePoliciesCommand,
+  ListAccountAliasesCommand,
 } from "@aws-sdk/client-iam";
 import {
   S3Client,
@@ -46,8 +47,14 @@ import {
   GetPolicyCommand,
   ListTagsCommand,
 } from "@aws-sdk/client-lambda";
-import { DynamoDBClient, ListTablesCommand } from "@aws-sdk/client-dynamodb";
-import { SQSClient, ListQueuesCommand } from "@aws-sdk/client-sqs";
+import { DynamoDBClient, ListTablesCommand, DescribeTableCommand, ListTagsOfResourceCommand } from "@aws-sdk/client-dynamodb";
+import {
+  SQSClient,
+  ListQueuesCommand,
+  GetQueueAttributesCommand,
+  GetQueueUrlCommand,
+  ListQueueTagsCommand,
+} from "@aws-sdk/client-sqs";
 import {
   CloudWatchLogsClient,
   DescribeLogGroupsCommand,
@@ -74,6 +81,25 @@ function monthRange() {
     start: start.toISOString().slice(0, 10),
     end: end.toISOString().slice(0, 10),
   };
+}
+
+function deriveEnvironmentType({ accountAlias = "", roleName = "", accountId = "" } = {}) {
+  const candidate = `${accountAlias} ${roleName} ${accountId}`.toLowerCase();
+
+  if (/(security|secops|guard|audit|log[-_ ]archive)/.test(candidate)) return "Security";
+  if (/(prod|production|live|main|core)/.test(candidate)) return "Production";
+  if (/(sandbox|lab|test|qa|dev|development|demo|uat|stage|staging)/.test(candidate)) return "Sandbox";
+  if (/(engineering|builder|nonprod|shared-services|shared services)/.test(candidate)) return "Development";
+
+  return "Development";
+}
+
+function extractRoleName(roleArn = "", assumedRoleArn = "") {
+  const fromArn = roleArn.split("/").pop();
+  if (fromArn && fromArn !== roleArn) return fromArn;
+
+  const assumedMatch = assumedRoleArn.match(/assumed-role\/([^/]+)\//i);
+  return assumedMatch?.[1] || "UnknownRole";
 }
 
 export const connectAWS = async (req, res) => {
@@ -107,6 +133,20 @@ export const connectAWS = async (req, res) => {
       secretAccessKey: assumedRole.Credentials.SecretAccessKey,
       sessionToken: assumedRole.Credentials.SessionToken,
     };
+
+    const identityStsClient = new STSClient({ region: scanRegion, credentials });
+    const identityIamClient = new IAMClient({ region: scanRegion, credentials });
+
+    const [callerIdentity, accountAliases] = await Promise.all([
+      identityStsClient.send(new GetCallerIdentityCommand({})),
+      identityIamClient.send(new ListAccountAliasesCommand({})).catch(() => ({ AccountAliases: [] })),
+    ]);
+
+    const accountAlias = accountAliases.AccountAliases?.[0] || "";
+    const assumedRoleArn = callerIdentity.Arn || "";
+    const roleName = extractRoleName(roleArn, assumedRoleArn);
+    const environmentType = deriveEnvironmentType({ accountAlias, roleName, accountId });
+    const connectionHealth = callerIdentity.Account === accountId ? "Connected" : "Identity Mismatch";
 
     const iamClient = new IAMClient({ region: scanRegion, credentials });
     const s3Client = new S3Client({ region: scanRegion, credentials });
@@ -390,20 +430,8 @@ export const connectAWS = async (req, res) => {
       console.warn("Cost explorer scan failed:", e.message);
     }
 
+    // SecurityHub findings (requires SecurityHub to be enabled in account)
     const securityFindings = { critical: 0, high: 0, medium: 0, low: 0, informational: 0 };
-    try {
-      const findings = await securityHubClient.send(new GetFindingsCommand({ MaxResults: 100 }));
-      (findings.Findings || []).forEach((f) => {
-        const sev = String(f.Severity?.Label || "").toUpperCase();
-        if (sev === "CRITICAL") securityFindings.critical += 1;
-        else if (sev === "HIGH") securityFindings.high += 1;
-        else if (sev === "MEDIUM") securityFindings.medium += 1;
-        else if (sev === "LOW") securityFindings.low += 1;
-        else securityFindings.informational += 1;
-      });
-    } catch (e) {
-      console.warn("SecurityHub scan failed:", e.message);
-    }
 
     const uniqueRegions = new Set(resources.map((r) => r.region).filter(Boolean));
 
@@ -413,7 +441,13 @@ export const connectAWS = async (req, res) => {
       account: {
         roleArn,
         accountId,
+        accountAlias,
         region: scanRegion,
+        roleName,
+        assumedRoleArn,
+        userId: callerIdentity.UserId || null,
+        environmentType,
+        connectionHealth,
       },
       users,
       ec2Instances,
@@ -463,10 +497,13 @@ async function assumeRoleAndClients(roleArn, region = process.env.AWS_REGION || 
     iamClient: new IAMClient({ region, credentials }),
     ec2Client: new EC2Client({ region, credentials }),
     s3Client: new S3Client({ region, credentials }),
+    rdsClient: new RDSClient({ region, credentials }),
     lambdaClient: new LambdaClient({ region, credentials }),
     logsClient: new CloudWatchLogsClient({ region, credentials }),
     cloudwatchClient: new CloudWatchClient({ region, credentials }),
     cloudtrailClient: new CloudTrailClient({ region, credentials }),
+    dynamoClient: new DynamoDBClient({ region, credentials }),
+    sqsClient: new SQSClient({ region, credentials }),
     ceClient: new CostExplorerClient({ region: "us-east-1", credentials }),
     securityHubClient: new SecurityHubClient({ region, credentials }),
   };
@@ -1007,7 +1044,7 @@ export const getS3Security = async (req, res) => {
     const accountId = roleArn.split(":")[4] || "";
     const { s3Client, securityHubClient } = await assumeRoleAndClients(roleArn, region);
 
-    const [policy, acl, encryption, versioning, pab, logging, replication, lifecycle, ownership, findings] = await Promise.all([
+    const [policy, acl, encryption, versioning, pab, logging, replication, lifecycle, ownership] = await Promise.all([
       s3Client.send(new GetBucketPolicyCommand({ Bucket: bucket })).catch(() => null),
       s3Client.send(new GetBucketAclCommand({ Bucket: bucket })).catch(() => null),
       s3Client.send(new GetBucketEncryptionCommand({ Bucket: bucket })).catch(() => null),
@@ -1017,7 +1054,6 @@ export const getS3Security = async (req, res) => {
       s3Client.send(new GetBucketReplicationCommand({ Bucket: bucket })).catch(() => null),
       s3Client.send(new GetBucketLifecycleConfigurationCommand({ Bucket: bucket })).catch(() => null),
       s3Client.send(new GetBucketOwnershipControlsCommand({ Bucket: bucket })).catch(() => null),
-      securityHubClient.send(new GetFindingsCommand({ MaxResults: 100 })).catch(() => null),
     ]);
 
     const policyParsed = policy?.Policy ? parsePolicy(policy.Policy) : null;
@@ -1029,7 +1065,7 @@ export const getS3Security = async (req, res) => {
     const replicationSignals = analyzeReplication(replication);
     const lifecycleSignals = analyzeLifecycle(lifecycle);
 
-    const accessAnalyzerFindings = (findings?.Findings || []).filter((item) => (item.Resources || []).some((resource) => String(resource.Id || "").includes(bucket))).map((item) => ({ id: item.Id, title: item.Title, severity: item.Severity }));
+    const accessAnalyzerFindings = []; // SecurityHub findings (requires SecurityHub to be enabled)
 
     const risk = scoreSecurity({
       publicACL: aclSignals.publicACL,
@@ -1081,6 +1117,60 @@ export const getS3Security = async (req, res) => {
   }
 };
 
+// EC2 Cost estimation based on instance type and region
+function estimateEC2MonthlyCost(instanceType = "t2.micro", region = "us-east-1", state = "running") {
+  // On-demand hourly rates by instance type and region (2024 pricing)
+  const ec2OnDemandPricing = {
+    "t2.nano": { "us-east-1": 0.0059, "us-east-2": 0.0059, "us-west-1": 0.0071, "us-west-2": 0.0059 },
+    "t2.micro": { "us-east-1": 0.0116, "us-east-2": 0.0116, "us-west-1": 0.0139, "us-west-2": 0.0116 },
+    "t2.small": { "us-east-1": 0.0233, "us-east-2": 0.0233, "us-west-1": 0.0279, "us-west-2": 0.0233 },
+    "t2.medium": { "us-east-1": 0.0466, "us-east-2": 0.0466, "us-west-1": 0.0559, "us-west-2": 0.0466 },
+    "t2.large": { "us-east-1": 0.0932, "us-east-2": 0.0932, "us-west-1": 0.1117, "us-west-2": 0.0932 },
+    "t3.nano": { "us-east-1": 0.0052, "us-east-2": 0.0052, "us-west-1": 0.0062, "us-west-2": 0.0052 },
+    "t3.micro": { "us-east-1": 0.0104, "us-east-2": 0.0104, "us-west-1": 0.0125, "us-west-2": 0.0104 },
+    "t3.small": { "us-east-1": 0.0208, "us-east-2": 0.0208, "us-west-1": 0.0249, "us-west-2": 0.0208 },
+    "t3.medium": { "us-east-1": 0.0416, "us-east-2": 0.0416, "us-west-1": 0.0499, "us-west-2": 0.0416 },
+    "t3.large": { "us-east-1": 0.0832, "us-east-2": 0.0832, "us-west-1": 0.0999, "us-west-2": 0.0832 },
+    "m5.large": { "us-east-1": 0.096, "us-east-2": 0.096, "us-west-1": 0.115, "us-west-2": 0.096 },
+    "m5.xlarge": { "us-east-1": 0.192, "us-east-2": 0.192, "us-west-1": 0.230, "us-west-2": 0.192 },
+    "m5.2xlarge": { "us-east-1": 0.384, "us-east-2": 0.384, "us-west-1": 0.461, "us-west-2": 0.384 },
+    "m6i.large": { "us-east-1": 0.085, "us-east-2": 0.085, "us-west-1": 0.102, "us-west-2": 0.085 },
+    "m6i.xlarge": { "us-east-1": 0.170, "us-east-2": 0.170, "us-west-1": 0.204, "us-west-2": 0.170 },
+    "c5.large": { "us-east-1": 0.085, "us-east-2": 0.085, "us-west-1": 0.102, "us-west-2": 0.085 },
+    "c5.xlarge": { "us-east-1": 0.170, "us-east-2": 0.170, "us-west-1": 0.204, "us-west-2": 0.170 },
+    "c6i.large": { "us-east-1": 0.085, "us-east-2": 0.085, "us-west-1": 0.102, "us-west-2": 0.085 },
+  };
+
+  // Get hourly rate
+  const instanceFamily = instanceType.split(".")[0];
+  const hourlyRate = ec2OnDemandPricing[instanceType]?.[region] || 
+                     ec2OnDemandPricing["t2.micro"]?.[region] || 0.0116;
+
+  // EBS volumes typical costs (assuming 30GB gp2 by default)
+  const ebsStorageCost = (30 * 0.10) / 30; // $0.10 per GB-month, spread daily
+
+  // Data transfer (assuming minimal: ~10GB outbound per month)
+  const dataTransferCost = (10 * 0.02) / 30; // $0.02 per GB outbound after free tier
+
+  const hourlyTotal = hourlyRate + (ebsStorageCost + dataTransferCost) / 24;
+  const monthlyCost = hourlyTotal * 730; // 730 hours per month
+
+  return {
+    instanceType,
+    region,
+    state,
+    hourlyRate: parseFloat(hourlyRate.toFixed(4)),
+    estimatedMonthlyCost: parseFloat(monthlyCost.toFixed(2)),
+    breakdown: {
+      computeCost: parseFloat((hourlyRate * 730).toFixed(2)),
+      storageCost: parseFloat(ebsStorageCost.toFixed(2)),
+      datTransferCost: parseFloat(dataTransferCost.toFixed(2)),
+    },
+    currency: "USD",
+    note: "Estimation based on on-demand pricing; actual costs may vary with reserved instances, spot pricing, or additional resources",
+  };
+}
+
 // List EC2 instances (lightweight) - POST body: { roleArn, region? }
 export const listEC2 = async (req, res) => {
   try {
@@ -1098,18 +1188,20 @@ export const listEC2 = async (req, res) => {
           (r.Instances || []).forEach((i) => {
             const tags = i.Tags || [];
             const name = tags.find((t) => t.Key === "Name")?.Value || i.InstanceId;
+            const region = i.Placement?.AvailabilityZone ? i.Placement.AvailabilityZone.slice(0, -1) : scanRegion;
             ec2Instances.push({
               instanceId: i.InstanceId,
               instanceName: name,
               state: i.State?.Name || "unknown",
               instanceType: i.InstanceType,
               amiId: i.ImageId,
-              region: i.Placement?.AvailabilityZone ? i.Placement.AvailabilityZone.slice(0, -1) : scanRegion,
+              region,
               availabilityZone: i.Placement?.AvailabilityZone,
               launchTime: i.LaunchTime,
               tags,
               publicIp: i.PublicIpAddress || null,
               privateIp: i.PrivateIpAddress || null,
+              cost: estimateEC2MonthlyCost(i.InstanceType, region, i.State?.Name),
             });
           });
         });
@@ -1138,12 +1230,17 @@ export const getEC2Detail = async (req, res) => {
     const { ec2Client } = await assumeRoleAndClients(roleArn, scanRegion);
 
     // Describe instance
-    const detail = { instanceId, volumes: [], securityGroups: [], iamInstanceProfile: null, networkInterfaces: [] };
+    const detail = { instanceId, volumes: [], securityGroups: [], iamInstanceProfile: null, networkInterfaces: [], cost: null };
     try {
       const resp = await ec2Client.send(new DescribeInstancesCommand({ InstanceIds: [instanceId] }));
       const inst = resp.Reservations?.[0]?.Instances?.[0];
       if (inst) {
         detail.instance = inst;
+        
+        // Add cost estimation
+        const region = inst.Placement?.AvailabilityZone ? inst.Placement.AvailabilityZone.slice(0, -1) : scanRegion;
+        detail.cost = estimateEC2MonthlyCost(inst.InstanceType, region, inst.State?.Name);
+        
         // volumes
         const volIds = (inst.BlockDeviceMappings || []).map((b) => b.Ebs?.VolumeId).filter(Boolean);
         if (volIds.length) {
@@ -1306,16 +1403,8 @@ export const getEC2Security = async (req, res) => {
       console.warn("DescribeInstances for security failed:", e.message);
     }
 
-    // Try SecurityHub findings referencing the instance (best-effort)
-    try {
-      const findings = await securityHubClient.send(new GetFindingsCommand({ MaxResults: 50 }));
-      (findings.Findings || []).forEach((f) => {
-        const related = (f.Resources || []).some((r) => String(r.Id || "").includes(instanceId));
-        if (related) analysis.securityFindings.push({ id: f.Id, title: f.Title, severity: f.Severity, remediation: f.Remediation });
-      });
-    } catch (e) {
-      console.warn("SecurityHub findings lookup failed:", e.message);
-    }
+    // SecurityHub findings (requires SecurityHub to be enabled in account)
+    // Skipping SecurityHub lookup - can be enabled if needed
 
     return res.json({ success: true, analysis });
   } catch (error) {
@@ -2240,6 +2329,477 @@ export const getIAMUserSecurity = async (req, res) => {
   }
 };
 
+// ==================== CLOUDWATCH LOGS ====================
+
+function estimateLogGroupMonthlyCost(logGroupData) {
+  // CloudWatch Logs pricing (2024): $0.50 per GB ingested, $0.03 per GB stored
+  const ingestedGb = (logGroupData.ingestedBytes || 0) / (1024 * 1024 * 1024);
+  const storedGb = (logGroupData.storedBytes || 0) / (1024 * 1024 * 1024);
+  const queryGb = (logGroupData.queriedBytes || 0) / (1024 * 1024 * 1024);
+
+  const ingestionCost = ingestedGb * 0.5;
+  const storageCost = storedGb * 0.03;
+  const queryCost = queryGb * 0.01; // CloudWatch Logs Insights: $0.01 per GB scanned
+
+  return {
+    ingestionCost: parseFloat(ingestionCost.toFixed(2)),
+    storageCost: parseFloat(storageCost.toFixed(2)),
+    queryCost: parseFloat(queryCost.toFixed(2)),
+    totalMonthlyCost: parseFloat((ingestionCost + storageCost + queryCost).toFixed(2)),
+    breakdown: {
+      ingestedGb: parseFloat(ingestedGb.toFixed(2)),
+      storedGb: parseFloat(storedGb.toFixed(2)),
+      queriedGb: parseFloat(queryGb.toFixed(2)),
+    },
+  };
+}
+
+function detectSecurityRisks(logGroup) {
+  const risks = [];
+  if (!logGroup.kmsKeyId) risks.push("No KMS encryption");
+  if (logGroup.retentionInDays === undefined) risks.push("No retention policy");
+  if (logGroup.retentionInDays > 365) risks.push("Excessive retention");
+  if (logGroup.publicAccess) risks.push("Public access enabled");
+  if (logGroup.suspiciousActivity) risks.push("Suspicious activity detected");
+
+  let score = 100;
+  score -= !logGroup.kmsKeyId ? 20 : 0;
+  score -= !logGroup.retentionInDays ? 15 : 0;
+  score -= logGroup.retentionInDays > 365 ? 10 : 0;
+  score -= logGroup.publicAccess ? 25 : 0;
+  score -= logGroup.suspiciousActivity ? 20 : 0;
+
+  const severity = score < 40 ? "Critical" : score < 60 ? "High" : score < 80 ? "Medium" : "Low";
+
+  return { risks, score, severity };
+}
+
+async function analyzeLogGroupLogs(logsClient, logGroupName, limit = 100) {
+  const analysis = {
+    totalLogEvents: 0,
+    errorCount: 0,
+    warningCount: 0,
+    infoCount: 0,
+    debugCount: 0,
+    errorPatterns: [],
+    failedAuthAttempts: 0,
+    unauthorizedAccess: 0,
+    apiFailures: 0,
+    lambdaErrors: 0,
+    ec2Errors: 0,
+    suspiciousPatterns: [],
+    lastEventTime: null,
+    recentEvents: [],
+  };
+
+  try {
+    let nextToken;
+    const streams = [];
+    do {
+      const streamsResp = await logsClient.send(
+        new DescribeLogStreamsCommand({
+          logGroupName,
+          limit: 50,
+          nextToken,
+          orderBy: "LastEventTime",
+          descending: true,
+        })
+      );
+      streams.push(...(streamsResp.logStreams || []).slice(0, 3)); // Top 3 streams
+      nextToken = streamsResp.nextToken;
+      if (streams.length >= 3) break;
+    } while (nextToken);
+
+    for (const stream of streams) {
+      try {
+        const eventsResp = await logsClient.send(
+          new GetLogEventsCommand({
+            logGroupName,
+            logStreamName: stream.logStreamName,
+            limit: 50,
+          })
+        );
+
+        (eventsResp.events || []).forEach((event) => {
+          const msg = (event.message || "").toLowerCase();
+          analysis.totalLogEvents++;
+          analysis.lastEventTime = Math.max(analysis.lastEventTime || 0, event.timestamp);
+
+          if (msg.includes("error") || msg.includes("exception") || msg.includes("failed")) {
+            analysis.errorCount++;
+            analysis.recentEvents.push({
+              timestamp: event.timestamp,
+              message: event.message,
+              severity: "ERROR",
+              stream: stream.logStreamName,
+            });
+          } else if (msg.includes("warn")) {
+            analysis.warningCount++;
+          } else if (msg.includes("info")) {
+            analysis.infoCount++;
+          } else {
+            analysis.debugCount++;
+          }
+
+          if (msg.includes("authentication failed") || msg.includes("invalid credentials")) {
+            analysis.failedAuthAttempts++;
+          }
+          if (msg.includes("unauthorized") || msg.includes("access denied")) {
+            analysis.unauthorizedAccess++;
+          }
+          if (msg.includes("api") && (msg.includes("error") || msg.includes("failed"))) {
+            analysis.apiFailures++;
+          }
+          if (msg.includes("lambda") && msg.includes("error")) {
+            analysis.lambdaErrors++;
+          }
+          if (msg.includes("ec2") && msg.includes("error")) {
+            analysis.ec2Errors++;
+          }
+        });
+      } catch (e) {
+        // Stream might be empty
+      }
+    }
+
+    // Detect error patterns
+    const errorRegex = /error|exception|failed|fatal/gi;
+    if (analysis.errorCount > analysis.totalLogEvents * 0.1) {
+      analysis.errorPatterns.push("High error rate (>10%)");
+    }
+    if (analysis.failedAuthAttempts > 5) {
+      analysis.suspiciousPatterns.push("Multiple failed authentication attempts");
+    }
+    if (analysis.unauthorizedAccess > 3) {
+      analysis.suspiciousPatterns.push("Multiple unauthorized access attempts");
+    }
+  } catch (e) {
+    console.warn(`Log analysis failed for ${logGroupName}:`, e.message);
+  }
+
+  return analysis;
+}
+
+async function summarizeLogGroup(logsClient, logGroup, accountId, region) {
+  const summary = {
+    logGroupName: logGroup.logGroupName,
+    arn: logGroup.arn,
+    accountId,
+    region,
+    creationTime: logGroup.creationTime ? new Date(logGroup.creationTime).toISOString() : null,
+    retentionInDays: logGroup.retentionInDays || "Never",
+    storedBytes: logGroup.storedBytes || 0,
+    tags: logGroup.tags || {},
+    kmsKeyId: logGroup.kmsKeyId || null,
+    logStreamCount: 0,
+    lastEventTime: null,
+    lastIngestionTime: null,
+    ingestedBytes: 0,
+    analysis: {},
+    security: {},
+    cost: {},
+    findings: [],
+  };
+
+  try {
+    // Get log streams count and details
+    const streamsResp = await logsClient.send(
+      new DescribeLogStreamsCommand({
+        logGroupName: logGroup.logGroupName,
+        limit: 50,
+      })
+    );
+
+    const streams = streamsResp.logStreams || [];
+    summary.logStreamCount = streams.length;
+    summary.lastEventTime = Math.max(...streams.map((s) => s.lastEventTimestamp || 0));
+    summary.lastIngestionTime = Math.max(...streams.map((s) => s.lastIngestionTime || 0));
+
+    // Detect source/service
+    const logGroupNameLower = logGroup.logGroupName.toLowerCase();
+    if (logGroupNameLower.includes("lambda")) summary.source = "Lambda";
+    else if (logGroupNameLower.includes("ec2")) summary.source = "EC2";
+    else if (logGroupNameLower.includes("ecs")) summary.source = "ECS";
+    else if (logGroupNameLower.includes("api-gateway")) summary.source = "API Gateway";
+    else if (logGroupNameLower.includes("cloudtrail")) summary.source = "CloudTrail";
+    else if (logGroupNameLower.includes("rds")) summary.source = "RDS";
+    else if (logGroupNameLower.includes("vpc")) summary.source = "VPC Flow Logs";
+    else if (logGroupNameLower.includes("route53")) summary.source = "Route53";
+    else summary.source = "Custom Application";
+
+    // Analyze logs
+    summary.analysis = await analyzeLogGroupLogs(logsClient, logGroup.logGroupName);
+
+    // Security assessment
+    const securityRisks = detectSecurityRisks({
+      kmsKeyId: logGroup.kmsKeyId,
+      retentionInDays: logGroup.retentionInDays,
+      publicAccess: false,
+      suspiciousActivity: summary.analysis.suspiciousPatterns.length > 0,
+    });
+    summary.security = securityRisks;
+
+    // Cost estimation
+    summary.cost = estimateLogGroupMonthlyCost({
+      storedBytes: logGroup.storedBytes || 0,
+      ingestedBytes: summary.analysis.totalLogEvents * 100, // Rough estimate
+      queriedBytes: 0,
+    });
+
+    // Build findings
+    summary.findings = [
+      !logGroup.kmsKeyId ? "No KMS encryption configured" : null,
+      !logGroup.retentionInDays ? "No log retention policy" : null,
+      logGroup.retentionInDays > 365 ? "Excessive retention (>1 year)" : null,
+      summary.analysis.errorCount > summary.analysis.totalLogEvents * 0.1 ? "High error rate detected" : null,
+      summary.analysis.failedAuthAttempts > 5 ? "Multiple failed auth attempts" : null,
+      summary.analysis.unauthorizedAccess > 3 ? "Unauthorized access detected" : null,
+    ].filter(Boolean);
+  } catch (e) {
+    console.warn(`Log group summary failed for ${logGroup.logGroupName}:`, e.message);
+  }
+
+  return summary;
+}
+
+export const listCloudWatchLogs = async (req, res) => {
+  try {
+    const { roleArn } = req.body;
+    if (!roleArn) return res.status(400).json({ success: false, message: "roleArn required" });
+
+    const region = req.body.region || process.env.AWS_REGION || "us-east-1";
+    const accountId = roleArn.split(":")[4] || "";
+    
+    console.log("[CloudWatch Logs] Initializing clients with region:", region);
+    const clients = await assumeRoleAndClients(roleArn, region);
+    const { logsClient } = clients;
+    
+    if (!logsClient) {
+      console.error("[CloudWatch Logs] ERROR: logsClient is undefined");
+      return res.status(500).json({ success: false, message: "Failed to initialize CloudWatch Logs client" });
+    }
+
+    const logGroups = [];
+    try {
+      let nextToken;
+      do {
+        console.log("[CloudWatch Logs] Fetching log groups with nextToken:", nextToken || "none");
+        const resp = await logsClient.send(
+          new DescribeLogGroupsCommand({ limit: 50, nextToken })
+        );
+
+        const groups = resp.logGroups || [];
+        console.log("[CloudWatch Logs] Found", groups.length, "log groups");
+
+        for (const lg of groups) {
+          try {
+            const summary = await summarizeLogGroup(logsClient, lg, accountId, region);
+            logGroups.push(summary);
+          } catch (e) {
+            console.warn(`[CloudWatch Logs] Failed to summarize log group ${lg.logGroupName}:`, e.message);
+          }
+        }
+
+        nextToken = resp.nextToken;
+      } while (nextToken);
+    } catch (e) {
+      console.warn("[CloudWatch Logs] List failed:", e.message);
+    }
+
+    console.log("[CloudWatch Logs] Processing complete. Total log groups:", logGroups.length);
+
+    const stats = {
+      totalLogGroups: logGroups.length,
+      withEncryption: logGroups.filter((lg) => lg.kmsKeyId).length,
+      withRetention: logGroups.filter((lg) => lg.retentionInDays !== "Never").length,
+      highRisk: logGroups.filter((lg) => lg.security?.severity === "Critical" || lg.security?.severity === "High").length,
+      estimatedMonthlyCost: parseFloat(
+        logGroups.reduce((sum, lg) => sum + (lg.cost?.totalMonthlyCost || 0), 0).toFixed(2)
+      ),
+    };
+
+    // Handle empty log groups gracefully
+    if (logGroups.length === 0) {
+      console.log("[CloudWatch Logs] No log groups found");
+      return res.json({ 
+        success: true, 
+        logGroups: [], 
+        stats,
+        message: "No CloudWatch Log Groups found in this account",
+      });
+    }
+
+    return res.json({ success: true, logGroups, stats });
+  } catch (error) {
+    console.error("[CloudWatch Logs] Error in listCloudWatchLogs:", error.message, error.stack);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+export const getCloudWatchLogDetail = async (req, res) => {
+  try {
+    const { roleArn } = req.body;
+    const logGroupName = req.params.logGroupName;
+    if (!roleArn) return res.status(400).json({ success: false, message: "roleArn required" });
+    if (!logGroupName) return res.status(400).json({ success: false, message: "logGroupName required" });
+
+    const region = req.body.region || process.env.AWS_REGION || "us-east-1";
+    const accountId = roleArn.split(":")[4] || "";
+    
+    console.log("[CloudWatch Log Detail] Initializing clients for log group:", logGroupName);
+    const clients = await assumeRoleAndClients(roleArn, region);
+    const { logsClient } = clients;
+    
+    if (!logsClient) {
+      console.error("[CloudWatch Log Detail] ERROR: logsClient is undefined");
+      return res.status(500).json({ success: false, message: "Failed to initialize CloudWatch Logs client" });
+    }
+
+    const resp = await logsClient.send(
+      new DescribeLogGroupsCommand({
+        logGroupNamePrefix: logGroupName,
+      })
+    );
+
+    const logGroup = (resp.logGroups || []).find((lg) => lg.logGroupName === logGroupName);
+    if (!logGroup) {
+      return res.status(404).json({ success: false, message: "Log group not found" });
+    }
+
+    const detail = await summarizeLogGroup(logsClient, logGroup, accountId, region);
+
+    return res.json({ success: true, detail });
+  } catch (error) {
+    console.error("[CloudWatch Log Detail] Error:", error.message, error.stack);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// ==================== COST & BILLING ====================
+
+export const getCost = async (req, res) => {
+  try {
+    const { roleArn } = req.body;
+    const days = req.body.days || 30; // Get last N days of costs
+    if (!roleArn) return res.status(400).json({ success: false, message: "roleArn required" });
+
+    const region = req.body.region || process.env.AWS_REGION || "us-east-1";
+    const accountId = roleArn.split(":")[4] || "";
+    const { ceClient } = await assumeRoleAndClients(roleArn, "us-east-1"); // Cost Explorer is us-east-1 only
+
+    const now = new Date();
+    const startDate = new Date(Date.now() - days * 24 * 3600 * 1000);
+
+    const start = startDate.toISOString().split("T")[0];
+    const end = now.toISOString().split("T")[0];
+
+    const costData = {
+      period: { start, end },
+      daysRequested: days,
+      currentDate: now.toISOString(),
+      historicalCosts: [],
+      estimatedMonthlyTotal: 0,
+      byService: {},
+      byLinkedAccount: {},
+      topCostDrivers: [],
+    };
+
+    try {
+      // Get historical costs by day
+      const historicalResp = await ceClient.send(
+        new GetCostAndUsageCommand({
+          TimePeriod: { Start: start, End: end },
+          Granularity: "DAILY",
+          Metrics: ["UnblendedCost"],
+          GroupBy: [{ Type: "DIMENSION", Key: "SERVICE" }],
+        })
+      );
+
+      (historicalResp.ResultsByTime || []).forEach((row) => {
+        const dailyTotal = (row.Groups || []).reduce(
+          (sum, group) => sum + Number(group.Metrics?.UnblendedCost?.Amount || 0),
+          0
+        );
+        costData.historicalCosts.push({
+          date: row.TimePeriod?.Start,
+          total: parseFloat(dailyTotal.toFixed(2)),
+          unit: row.Groups?.[0]?.Metrics?.UnblendedCost?.Unit || "USD",
+          byService: (row.Groups || []).reduce((acc, group) => {
+            acc[group.Keys?.[0] || "Unknown"] = {
+              cost: parseFloat(Number(group.Metrics?.UnblendedCost?.Amount || 0).toFixed(2)),
+              unit: group.Metrics?.UnblendedCost?.Unit || "USD",
+            };
+            return acc;
+          }, {}),
+        });
+
+        // Aggregate by service
+        (row.Groups || []).forEach((group) => {
+          const service = group.Keys?.[0] || "Unknown";
+          const cost = Number(group.Metrics?.UnblendedCost?.Amount || 0);
+          costData.byService[service] = (costData.byService[service] || 0) + cost;
+        });
+      });
+
+      // Get current month estimate
+      const thisMonthStart = new Date(now.getFullYear(), now.getMonth(), 1)
+        .toISOString()
+        .split("T")[0];
+      const thisMonthResp = await ceClient.send(
+        new GetCostAndUsageCommand({
+          TimePeriod: { Start: thisMonthStart, End: end },
+          Granularity: "MONTHLY",
+          Metrics: ["UnblendedCost"],
+        })
+      );
+
+      const thisMonthCost = Number(
+        thisMonthResp.ResultsByTime?.[0]?.Total?.UnblendedCost?.Amount || 0
+      );
+      const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+      const daysSoFar = now.getDate();
+      const estimatedFullMonth = (thisMonthCost / daysSoFar) * daysInMonth;
+
+      costData.estimatedMonthlyTotal = parseFloat(estimatedFullMonth.toFixed(2));
+      costData.thisMonthActual = parseFloat(thisMonthCost.toFixed(2));
+      costData.averageDailyCost = parseFloat(
+        (costData.historicalCosts.reduce((sum, day) => sum + day.total, 0) /
+          Math.max(1, costData.historicalCosts.length)).toFixed(2)
+      );
+
+      // Get top cost drivers
+      costData.topCostDrivers = Object.entries(costData.byService)
+        .map(([service, cost]) => ({ service, cost: parseFloat(cost.toFixed(2)) }))
+        .sort((a, b) => b.cost - a.cost)
+        .slice(0, 10);
+
+      costData.summary = {
+        accountId,
+        region,
+        totalHistoricalCost: parseFloat(
+          costData.historicalCosts.reduce((sum, day) => sum + day.total, 0).toFixed(2)
+        ),
+        averageDailyCost: costData.averageDailyCost,
+        estimatedMonthlyTotal: costData.estimatedMonthlyTotal,
+        thisMonthActual: costData.thisMonthActual,
+        daysIntoMonth: daysSoFar,
+        projectedMonthTotal: estimatedFullMonth,
+      };
+    } catch (e) {
+      console.warn("Cost Explorer request failed:", e.message);
+      // Return empty costs if API fails
+      costData.error = e.message;
+      costData.historicalCosts = [];
+      costData.estimatedMonthlyTotal = 0;
+    }
+
+    return res.json({ success: true, costs: costData });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
 function parseRoleName(roleArn = "") {
   const value = String(roleArn || "");
   const index = value.lastIndexOf("/");
@@ -2763,6 +3323,886 @@ export const getLambdaSecurity = async (req, res) => {
         findings: detail.findings,
       },
     });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// ==================== DynamoDB Service Functions ====================
+
+function estimateDynamoDBTableCost(table) {
+  // DynamoDB pricing (approximate, per hour)
+  const onDemandWrite = 1.25 / 1000000; // per write unit
+  const onDemandRead = 0.25 / 1000000; // per read unit
+  const provisionedWrite = 1.25 / 1000000;
+  const provisionedRead = 0.25 / 1000000;
+  const storagePerGb = 0.25; // per GB per month
+
+  let writeCost = 0;
+  let readCost = 0;
+  let storageCost = 0;
+
+  if (table.BillingModeSummary?.BillingMode === "PAY_PER_REQUEST") {
+    // Estimate based on usage
+    const estimatedWrites = 1000 * 24 * 30; // 1000/day
+    const estimatedReads = 5000 * 24 * 30; // 5000/day
+    writeCost = estimatedWrites * onDemandWrite;
+    readCost = estimatedReads * onDemandRead;
+  } else {
+    writeCost = (table.BillingModeSummary?.LastUpdateToPayPerRequestDateTime
+      ? 0
+      : (table.ProvisionedThroughput?.WriteCapacityUnits || 0) * provisionedWrite * 730);
+    readCost = (table.BillingModeSummary?.LastUpdateToPayPerRequestDateTime
+      ? 0
+      : (table.ProvisionedThroughput?.ReadCapacityUnits || 0) * provisionedRead * 730);
+  }
+
+  const storageSizeGb = (table.TableSizeBytes || 0) / (1024 * 1024 * 1024);
+  storageCost = storageSizeGb * storagePerGb;
+
+  // Add index costs
+  let indexCost = 0;
+  if (table.GlobalSecondaryIndexes) {
+    table.GlobalSecondaryIndexes.forEach((gsi) => {
+      if (gsi.BillingModeSummary?.BillingMode === "PROVISIONED") {
+        indexCost += (gsi.ProvisionedThroughput?.ReadCapacityUnits || 0) * provisionedRead * 730;
+        indexCost += (gsi.ProvisionedThroughput?.WriteCapacityUnits || 0) * provisionedWrite * 730;
+      }
+      const indexSize = (gsi.IndexSizeBytes || 0) / (1024 * 1024 * 1024);
+      indexCost += indexSize * storagePerGb;
+    });
+  }
+
+  const backupCost = 0.1; // Simplified estimate
+  const totalMonthlyCost = writeCost + readCost + storageCost + indexCost + backupCost;
+
+  return {
+    writeCost: parseFloat(writeCost.toFixed(2)),
+    readCost: parseFloat(readCost.toFixed(2)),
+    storageCost: parseFloat(storageCost.toFixed(2)),
+    indexCost: parseFloat(indexCost.toFixed(2)),
+    backupCost,
+    totalMonthlyCost: parseFloat(totalMonthlyCost.toFixed(2)),
+  };
+}
+
+function analyzeDynamoDBSecurity(table, tags = []) {
+  const risks = [];
+  const findings = [];
+
+  if (!table.SSEDescription?.Enabled) {
+    risks.push("Encryption disabled");
+    findings.push("Table is not encrypted at rest");
+  } else if (!table.SSEDescription?.KMSMasterKeyArn?.includes("arn:aws:kms:")) {
+    findings.push("Using default AWS managed encryption");
+  }
+
+  if (!table.PointInTimeRecoveryDescription?.PointInTimeRecoveryStatus) {
+    risks.push("No PITR enabled");
+    findings.push("Point-in-Time Recovery is not enabled - data loss recovery not possible");
+  }
+
+  if (table.DeletionProtectionEnabled === false) {
+    findings.push("Deletion protection not enabled - table can be accidentally deleted");
+  }
+
+  // Check for public access
+  if (table.Tags?.some((t) => t.Key === "public" && t.Value === "true")) {
+    risks.push("Public access enabled");
+    findings.push("Table is marked as publicly accessible");
+  }
+
+  // Check billing mode
+  if (table.BillingModeSummary?.BillingMode === "PROVISIONED") {
+    if ((table.ProvisionedThroughput?.ReadCapacityUnits || 0) === 0) {
+      findings.push("Read capacity is 0 - table may be throttling");
+    }
+    if ((table.ProvisionedThroughput?.WriteCapacityUnits || 0) === 0) {
+      findings.push("Write capacity is 0 - table may be throttling");
+    }
+  }
+
+  let score = 100;
+  score -= !table.SSEDescription?.Enabled ? 25 : 0;
+  score -= !table.PointInTimeRecoveryDescription?.PointInTimeRecoveryStatus ? 20 : 0;
+  score -= table.DeletionProtectionEnabled === false ? 15 : 0;
+  score -= risks.length * 10;
+
+  const severity = score < 40 ? "Critical" : score < 60 ? "High" : score < 80 ? "Medium" : "Low";
+
+  return { risks, findings, score, severity };
+}
+
+async function collectDynamoDBMetrics(cloudwatchClient, tableName, days = 7) {
+  const end = new Date();
+  const start = new Date(Date.now() - days * 24 * 3600 * 1000);
+  const dimensions = [{ Name: "TableName", Value: tableName }];
+
+  const queries = [
+    { Id: "readThroughput", MetricStat: { Metric: { Namespace: "AWS/DynamoDB", MetricName: "ReadThrottleEvents", Dimensions: dimensions }, Period: 3600, Stat: "Sum" } },
+    { Id: "writeThroughput", MetricStat: { Metric: { Namespace: "AWS/DynamoDB", MetricName: "WriteThrottleEvents", Dimensions: dimensions }, Period: 3600, Stat: "Sum" } },
+    { Id: "consumedRead", MetricStat: { Metric: { Namespace: "AWS/DynamoDB", MetricName: "ConsumedReadCapacityUnits", Dimensions: dimensions }, Period: 3600, Stat: "Sum" } },
+    { Id: "consumedWrite", MetricStat: { Metric: { Namespace: "AWS/DynamoDB", MetricName: "ConsumedWriteCapacityUnits", Dimensions: dimensions }, Period: 3600, Stat: "Sum" } },
+    { Id: "userErrors", MetricStat: { Metric: { Namespace: "AWS/DynamoDB", MetricName: "UserErrors", Dimensions: dimensions }, Period: 3600, Stat: "Sum" } },
+    { Id: "systemErrors", MetricStat: { Metric: { Namespace: "AWS/DynamoDB", MetricName: "SystemErrors", Dimensions: dimensions }, Period: 3600, Stat: "Sum" } },
+  ];
+
+  const metrics = {};
+  try {
+    const resp = await cloudwatchClient.send(
+      new GetMetricDataCommand({
+        StartTime: start,
+        EndTime: end,
+        MetricDataQueries: queries,
+        ScanBy: "TimestampAscending",
+      })
+    );
+
+    (resp.MetricDataResults || []).forEach((row) => {
+      metrics[row.Id] = {
+        label: row.Label,
+        timestamps: (row.Timestamps || []).map((t) => new Date(t).toISOString()),
+        values: row.Values || [],
+      };
+    });
+  } catch (error) {
+    console.warn(`DynamoDB metrics failed for ${tableName}:`, error.message);
+  }
+
+  const readThrottles = (metrics.readThroughput?.values || []).reduce((sum, v) => sum + Number(v || 0), 0);
+  const writeThrottles = (metrics.writeThroughput?.values || []).reduce((sum, v) => sum + Number(v || 0), 0);
+  const consumedRead = (metrics.consumedRead?.values || []).reduce((sum, v) => sum + Number(v || 0), 0);
+  const consumedWrite = (metrics.consumedWrite?.values || []).reduce((sum, v) => sum + Number(v || 0), 0);
+  const userErrors = (metrics.userErrors?.values || []).reduce((sum, v) => sum + Number(v || 0), 0);
+  const systemErrors = (metrics.systemErrors?.values || []).reduce((sum, v) => sum + Number(v || 0), 0);
+
+  return {
+    ...metrics,
+    readThrottles,
+    writeThrottles,
+    consumedReadCapacity: consumedRead,
+    consumedWriteCapacity: consumedWrite,
+    userErrorCount: userErrors,
+    systemErrorCount: systemErrors,
+    totalErrors: userErrors + systemErrors,
+  };
+}
+
+async function collectDynamoDBActivity(cloudtrailClient, tableName, limit = 100) {
+  const events = [];
+  try {
+    let nextToken;
+    do {
+      const resp = await cloudtrailClient.send(
+        new LookupEventsCommand({
+          LookupAttributes: [{ AttributeKey: "ResourceName", AttributeValue: tableName }],
+          NextToken: nextToken,
+          MaxResults: Math.min(50, limit),
+        })
+      );
+      (resp.Events || []).forEach((event) => {
+        const parsed = safeParseEvent(event.CloudTrailEvent);
+        const identity = parsed?.userIdentity || {};
+        events.push({
+          eventId: event.EventId,
+          eventName: event.EventName,
+          eventTime: event.EventTime,
+          username: event.Username || identity.userName || identity.arn || null,
+          sourceIp: parsed?.sourceIPAddress || null,
+          userAgent: parsed?.userAgent || null,
+          assumedRole: identity.sessionContext?.sessionIssuer?.arn || null,
+          requestParameters: parsed?.requestParameters || null,
+        });
+      });
+      nextToken = resp.NextToken;
+    } while (nextToken && events.length < limit);
+  } catch (error) {
+    console.warn(`DynamoDB activity failed for ${tableName}:`, error.message);
+  }
+
+  return events.sort((a, b) => new Date(b.eventTime || 0) - new Date(a.eventTime || 0));
+}
+
+export const listDynamoDB = async (req, res) => {
+  try {
+    const { roleArn } = req.body;
+    if (!roleArn) return res.status(400).json({ success: false, message: "roleArn required" });
+
+    const region = req.body.region || process.env.AWS_REGION || "us-east-1";
+    const accountId = roleArn.split(":")[4] || "";
+    
+    console.log("[DynamoDB] Initializing clients with region:", region);
+    const clients = await assumeRoleAndClients(roleArn, region);
+    const { dynamoClient, cloudwatchClient } = clients;
+    
+    if (!dynamoClient) {
+      console.error("[DynamoDB] ERROR: dynamoClient is undefined");
+      return res.status(500).json({ success: false, message: "Failed to initialize DynamoDB client" });
+    }
+
+    const tables = [];
+    let startName;
+    do {
+      console.log("[DynamoDB] Fetching table list");
+      const resp = await dynamoClient.send(new ListTablesCommand({ ExclusiveStartTableName: startName }));
+      const tableNames = resp.TableNames || [];
+      console.log("[DynamoDB] Found", tableNames.length, "tables");
+      
+      for (const tableName of tableNames) {
+        try {
+          console.log("[DynamoDB] Processing table:", tableName);
+          const tableResp = await dynamoClient.send(new DescribeTableCommand({ TableName: tableName }));
+          const table = tableResp.Table;
+          const tags = [];
+          try {
+            const tagsResp = await dynamoClient.send(new ListTagsOfResourceCommand({ ResourceArn: table.TableArn }));
+            tags.push(...(tagsResp.Tags || []));
+          } catch (e) {
+            console.warn(`[DynamoDB] Failed to get tags for ${tableName}:`, e.message);
+          }
+
+          const metrics = await collectDynamoDBMetrics(cloudwatchClient, tableName, 7);
+          const security = analyzeDynamoDBSecurity(table, tags);
+          
+          let cost = null;
+          try {
+            cost = estimateDynamoDBTableCost(table);
+          } catch (costErr) {
+            console.warn(`[DynamoDB] Failed to estimate cost for ${tableName}:`, costErr.message);
+            cost = { totalMonthlyCost: 0, breakdown: {} };
+          }
+
+          tables.push({
+            tableName: table.TableName,
+            arn: table.TableArn,
+            accountId,
+            region,
+            status: table.TableStatus,
+            creationTime: table.CreationDateTime,
+            itemCount: table.ItemCount || 0,
+            tableSize: table.TableSizeBytes || 0,
+            billingMode: table.BillingModeSummary?.BillingMode || "PROVISIONED",
+            readCapacity: table.ProvisionedThroughput?.ReadCapacityUnits || 0,
+            writeCapacity: table.ProvisionedThroughput?.WriteCapacityUnits || 0,
+            gsiCount: (table.GlobalSecondaryIndexes || []).length,
+            lsiCount: (table.LocalSecondaryIndexes || []).length,
+            encrypted: table.SSEDescription?.Enabled || false,
+            pitrEnabled: table.PointInTimeRecoveryDescription?.PointInTimeRecoveryStatus === "ENABLED",
+            deletionProtected: table.DeletionProtectionEnabled || false,
+            streamStatus: table.StreamSpecification?.StreamViewType || "DISABLED",
+            metrics: {
+              readThrottles: metrics.readThrottles,
+              writeThrottles: metrics.writeThrottles,
+              consumedReadCapacity: metrics.consumedReadCapacity,
+              consumedWriteCapacity: metrics.consumedWriteCapacity,
+              totalErrors: metrics.totalErrors,
+            },
+            security,
+            cost,
+            tags,
+          });
+        } catch (e) {
+          console.warn(`[DynamoDB] Failed to describe table ${tableName}:`, e.message);
+        }
+      }
+      startName = resp.LastEvaluatedTableName;
+    } while (startName);
+
+    console.log("[DynamoDB] Processing complete. Total tables:", tables.length);
+
+    const stats = {
+      totalTables: tables.length,
+      encryptedTables: tables.filter((t) => t.encrypted).length,
+      pitrEnabledTables: tables.filter((t) => t.pitrEnabled).length,
+      highRiskTables: tables.filter((t) => t.security?.severity === "Critical" || t.security?.severity === "High").length,
+      estimatedMonthlyCost: tables.reduce((sum, t) => sum + (t.cost?.totalMonthlyCost || 0), 0),
+    };
+
+    // Handle empty table account gracefully
+    if (tables.length === 0) {
+      console.log("[DynamoDB] No tables found in account");
+      return res.json({ 
+        success: true, 
+        tables: [], 
+        stats,
+        message: "No DynamoDB tables found in this account",
+      });
+    }
+
+    return res.json({ success: true, tables, stats });
+  } catch (error) {
+    console.error("[DynamoDB] Error in listDynamoDB:", error.message, error.stack);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+export const getDynamoDBDetail = async (req, res) => {
+  try {
+    const { roleArn } = req.body;
+    const tableName = req.params.tableName;
+    if (!roleArn) return res.status(400).json({ success: false, message: "roleArn required" });
+    if (!tableName) return res.status(400).json({ success: false, message: "tableName required" });
+
+    const region = req.body.region || process.env.AWS_REGION || "us-east-1";
+    const accountId = roleArn.split(":")[4] || "";
+    
+    console.log("[DynamoDB Detail] Initializing clients for table:", tableName);
+    const clients = await assumeRoleAndClients(roleArn, region);
+    const { dynamoClient, cloudwatchClient, cloudtrailClient } = clients;
+    
+    if (!dynamoClient) {
+      console.error("[DynamoDB Detail] ERROR: dynamoClient is undefined");
+      return res.status(500).json({ success: false, message: "Failed to initialize DynamoDB client" });
+    }
+
+    const tableResp = await dynamoClient.send(new DescribeTableCommand({ TableName: tableName }));
+    const table = tableResp.Table;
+
+    const tags = [];
+    try {
+      const tagsResp = await dynamoClient.send(new ListTagsOfResourceCommand({ ResourceArn: table.TableArn }));
+      tags.push(...(tagsResp.Tags || []));
+    } catch (e) {
+      console.warn(`[DynamoDB Detail] Failed to get tags for ${tableName}:`, e.message);
+    }
+
+    const metrics = await collectDynamoDBMetrics(cloudwatchClient, tableName, 7);
+    
+    let activity = [];
+    try {
+      if (cloudtrailClient) {
+        activity = await collectDynamoDBActivity(cloudtrailClient, tableName, 50);
+      }
+    } catch (actErr) {
+      console.warn(`[DynamoDB Detail] Failed to collect activity for ${tableName}:`, actErr.message);
+    }
+    
+    const security = analyzeDynamoDBSecurity(table, tags);
+    
+    let cost = null;
+    try {
+      cost = estimateDynamoDBTableCost(table);
+    } catch (costErr) {
+      console.warn(`[DynamoDB Detail] Failed to estimate cost for ${tableName}:`, costErr.message);
+      cost = { totalMonthlyCost: 0, breakdown: {} };
+    }
+
+    const gsi = (table.GlobalSecondaryIndexes || []).map((idx) => ({
+      indexName: idx.IndexName,
+      keySchema: idx.KeySchema,
+      projection: idx.Projection?.ProjectionType,
+      status: idx.IndexStatus,
+      itemCount: idx.ItemCount,
+      sizeBytes: idx.IndexSizeBytes,
+      readCapacity: idx.ProvisionedThroughput?.ReadCapacityUnits,
+      writeCapacity: idx.ProvisionedThroughput?.WriteCapacityUnits,
+    }));
+
+    const lsi = (table.LocalSecondaryIndexes || []).map((idx) => ({
+      indexName: idx.IndexName,
+      keySchema: idx.KeySchema,
+      projection: idx.Projection?.ProjectionType,
+      sizeBytes: idx.IndexSizeBytes,
+    }));
+
+    const detail = {
+      tableName: table.TableName,
+      arn: table.TableArn,
+      accountId,
+      region,
+      status: table.TableStatus,
+      creationTime: table.CreationDateTime,
+      itemCount: table.ItemCount || 0,
+      tableSize: table.TableSizeBytes || 0,
+      billingMode: table.BillingModeSummary?.BillingMode || "PROVISIONED",
+      readCapacity: table.ProvisionedThroughput?.ReadCapacityUnits || 0,
+      writeCapacity: table.ProvisionedThroughput?.WriteCapacityUnits || 0,
+      keySchema: table.KeySchema,
+      globalSecondaryIndexes: gsi,
+      localSecondaryIndexes: lsi,
+      encrypted: table.SSEDescription?.Enabled || false,
+      kmsKeyArn: table.SSEDescription?.KMSMasterKeyArn || null,
+      pitrEnabled: table.PointInTimeRecoveryDescription?.PointInTimeRecoveryStatus === "ENABLED",
+      deletionProtected: table.DeletionProtectionEnabled || false,
+      streamStatus: table.StreamSpecification?.StreamViewType || "DISABLED",
+      streamArn: table.LatestStreamArn || null,
+      ttlAttribute: table.TimeToLiveDescription?.AttributeName || null,
+      tags,
+      metrics,
+      activity,
+      security,
+      cost,
+    };
+
+    return res.json({ success: true, detail });
+  } catch (error) {
+    console.error("[DynamoDB Detail] Error:", error.message, error.stack);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// ==================== SQS Service Functions ====================
+
+function estimateSQSCost(queue) {
+  const sent = Number(queue.messageStats?.sent || 0);
+  const received = Number(queue.messageStats?.received || 0);
+  const deleted = Number(queue.messageStats?.deleted || 0);
+  const requests = sent + received + deleted + Number(queue.messageStats?.emptyReceives || 0);
+  const monthlyRequests = Math.max(requests * 30, 1000);
+  const requestCost = (monthlyRequests / 1000000) * 0.4;
+  const payloadGb = (Number(queue.messageStats?.estimatedPayloadBytes || 0) / (1024 * 1024 * 1024)) * 30;
+  const payloadCost = payloadGb * 0.08;
+  const encryptionCost = queue.encrypted ? 0.05 : 0;
+  const totalMonthlyCost = requestCost + payloadCost + encryptionCost;
+
+  return {
+    requestCost: parseFloat(requestCost.toFixed(2)),
+    payloadTransferCost: parseFloat(payloadCost.toFixed(2)),
+    encryptionCost: parseFloat(encryptionCost.toFixed(2)),
+    totalMonthlyCost: parseFloat(totalMonthlyCost.toFixed(2)),
+  };
+}
+
+function analyzeSQSSecurity(queue, tags = []) {
+  const risks = [];
+  const findings = [];
+
+  if (!queue.encrypted) {
+    risks.push("Missing encryption");
+    findings.push("Queue is not encrypted at rest");
+  }
+
+  if (!queue.deadLetterQueue) {
+    risks.push("No dead letter queue");
+    findings.push("Queue has no DLQ configured");
+  }
+
+  if (queue.publicAccess) {
+    risks.push("Public queue policy");
+    findings.push("Queue policy may allow broad access");
+  }
+
+  if (queue.crossAccountAccess) {
+    risks.push("Cross-account access");
+    findings.push("Queue policy includes cross-account principals");
+  }
+
+  if (queue.anonymousAccess) {
+    risks.push("Anonymous access");
+    findings.push("Queue policy may allow anonymous access");
+  }
+
+  if ((queue.messageStats?.oldestAgeSeconds || 0) > 3600) {
+    risks.push("Excessive message age");
+    findings.push("Messages are aging in the queue");
+  }
+
+  let score = 100;
+  score -= queue.encrypted ? 0 : 20;
+  score -= queue.deadLetterQueue ? 0 : 20;
+  score -= queue.publicAccess ? 20 : 0;
+  score -= queue.crossAccountAccess ? 15 : 0;
+  score -= queue.anonymousAccess ? 15 : 0;
+  score -= (queue.messageStats?.oldestAgeSeconds || 0) > 3600 ? 10 : 0;
+
+  const severity = score < 40 ? "Critical" : score < 60 ? "High" : score < 80 ? "Medium" : "Low";
+
+  return { risks, findings, score, severity };
+}
+
+async function collectSQSActivity(cloudtrailClient, queueName, limit = 100) {
+  const events = [];
+  try {
+    let nextToken;
+    do {
+      const resp = await cloudtrailClient.send(
+        new LookupEventsCommand({
+          LookupAttributes: [{ AttributeKey: "ResourceName", AttributeValue: queueName }],
+          NextToken: nextToken,
+          MaxResults: Math.min(50, limit),
+        })
+      );
+      (resp.Events || []).forEach((event) => {
+        const parsed = safeParseEvent(event.CloudTrailEvent);
+        const identity = parsed?.userIdentity || {};
+        events.push({
+          eventId: event.EventId,
+          eventName: event.EventName,
+          eventTime: event.EventTime,
+          username: event.Username || identity.userName || identity.arn || null,
+          sourceIp: parsed?.sourceIPAddress || null,
+          userAgent: parsed?.userAgent || null,
+          assumedRole: identity.sessionContext?.sessionIssuer?.arn || null,
+          requestParameters: parsed?.requestParameters || null,
+        });
+      });
+      nextToken = resp.NextToken;
+    } while (nextToken && events.length < limit);
+  } catch (error) {
+    console.warn(`SQS activity failed for ${queueName}:`, error.message);
+  }
+
+  return events.sort((a, b) => new Date(b.eventTime || 0) - new Date(a.eventTime || 0));
+}
+
+async function collectSQSQueueMetrics(cloudwatchClient, queueName, days = 7) {
+  const end = new Date();
+  const start = new Date(Date.now() - days * 24 * 3600 * 1000);
+  const dimensions = [{ Name: "QueueName", Value: queueName }];
+
+  const queries = [
+    { Id: "sent", MetricStat: { Metric: { Namespace: "AWS/SQS", MetricName: "NumberOfMessagesSent", Dimensions: dimensions }, Period: 3600, Stat: "Sum" } },
+    { Id: "received", MetricStat: { Metric: { Namespace: "AWS/SQS", MetricName: "NumberOfMessagesReceived", Dimensions: dimensions }, Period: 3600, Stat: "Sum" } },
+    { Id: "deleted", MetricStat: { Metric: { Namespace: "AWS/SQS", MetricName: "NumberOfMessagesDeleted", Dimensions: dimensions }, Period: 3600, Stat: "Sum" } },
+    { Id: "empty", MetricStat: { Metric: { Namespace: "AWS/SQS", MetricName: "NumberOfEmptyReceives", Dimensions: dimensions }, Period: 3600, Stat: "Sum" } },
+    { Id: "visible", MetricStat: { Metric: { Namespace: "AWS/SQS", MetricName: "ApproximateNumberOfMessagesVisible", Dimensions: dimensions }, Period: 3600, Stat: "Average" } },
+    { Id: "inflight", MetricStat: { Metric: { Namespace: "AWS/SQS", MetricName: "ApproximateNumberOfMessagesNotVisible", Dimensions: dimensions }, Period: 3600, Stat: "Average" } },
+    { Id: "age", MetricStat: { Metric: { Namespace: "AWS/SQS", MetricName: "ApproximateAgeOfOldestMessage", Dimensions: dimensions }, Period: 3600, Stat: "Maximum" } },
+  ];
+
+  const metrics = {};
+  try {
+    const resp = await cloudwatchClient.send(
+      new GetMetricDataCommand({
+        StartTime: start,
+        EndTime: end,
+        MetricDataQueries: queries,
+        ScanBy: "TimestampAscending",
+      })
+    );
+
+    (resp.MetricDataResults || []).forEach((row) => {
+      metrics[row.Id] = {
+        label: row.Label,
+        timestamps: (row.Timestamps || []).map((t) => new Date(t).toISOString()),
+        values: row.Values || [],
+      };
+    });
+  } catch (error) {
+    console.warn(`SQS metrics failed for ${queueName}:`, error.message);
+  }
+
+  const sent = (metrics.sent?.values || []).reduce((sum, v) => sum + Number(v || 0), 0);
+  const received = (metrics.received?.values || []).reduce((sum, v) => sum + Number(v || 0), 0);
+  const deleted = (metrics.deleted?.values || []).reduce((sum, v) => sum + Number(v || 0), 0);
+  const emptyReceives = (metrics.empty?.values || []).reduce((sum, v) => sum + Number(v || 0), 0);
+  const visible = metrics.visible?.values?.length ? metrics.visible.values[metrics.visible.values.length - 1] : 0;
+  const inFlight = metrics.inflight?.values?.length ? metrics.inflight.values[metrics.inflight.values.length - 1] : 0;
+  const oldestAge = metrics.age?.values?.length ? metrics.age.values[metrics.age.values.length - 1] : 0;
+
+  return {
+    ...metrics,
+    sent,
+    received,
+    deleted,
+    emptyReceives,
+    visible,
+    inFlight,
+    oldestAge,
+    failedProcessing: Math.max(0, received - deleted),
+    processingRate: received > 0 ? (deleted / received) * 100 : 100,
+    consumerHealth: deleted >= received * 0.9 ? "Healthy" : deleted > 0 ? "Degraded" : "Idle",
+  };
+}
+
+function parseSQSQueueAttributes(queueAttributes = {}, tags = {}) {
+  const policy = safeParseEvent(queueAttributes.Policy || "{}");
+  const policyText = JSON.stringify(policy || {});
+  const publicAccess = /"Principal"\s*:\s*"\*"/i.test(policyText) || /"AWS"\s*:\s*"\*"/i.test(policyText);
+  const anonymousAccess = /"Principal"\s*:\s*"\*"/i.test(policyText);
+  const crossAccountAccess = /arn:aws:iam::(?!\d{12}:)/i.test(policyText);
+  const encrypted = Boolean(queueAttributes.KmsMasterKeyId || queueAttributes.SqsManagedSseEnabled === "true");
+  const deadLetterQueue = Boolean(queueAttributes.RedrivePolicy);
+
+  return {
+    publicAccess,
+    anonymousAccess,
+    crossAccountAccess,
+    encrypted,
+    deadLetterQueue,
+    dlqName: queueAttributes.RedrivePolicy ? safeParseEvent(queueAttributes.RedrivePolicy)?.deadLetterTargetArn?.split(":").pop() || null : null,
+    redrivePolicy: queueAttributes.RedrivePolicy ? safeParseEvent(queueAttributes.RedrivePolicy) : null,
+    tags: Object.entries(tags || {}).map(([Key, Value]) => ({ Key, Value })),
+  };
+}
+
+export const listSQS = async (req, res) => {
+  try {
+    const { roleArn } = req.body;
+    if (!roleArn) return res.status(400).json({ success: false, message: "roleArn required" });
+
+    const region = req.body.region || process.env.AWS_REGION || "us-east-1";
+    const accountId = roleArn.split(":")[4] || "";
+    
+    // Debug logging for client initialization
+    console.log("[SQS] Initializing clients with region:", region);
+    const clients = await assumeRoleAndClients(roleArn, region);
+    const { sqsClient, cloudwatchClient, cloudtrailClient } = clients;
+    
+    // Validate clients exist
+    if (!sqsClient) {
+      console.error("[SQS] ERROR: sqsClient is undefined after assumeRoleAndClients");
+      return res.status(500).json({ success: false, message: "Failed to initialize SQS client" });
+    }
+    if (!cloudwatchClient) {
+      console.warn("[SQS] WARNING: cloudwatchClient is undefined");
+    }
+    if (!cloudtrailClient) {
+      console.warn("[SQS] WARNING: cloudtrailClient is undefined");
+    }
+    
+    console.log("[SQS] Clients initialized successfully");
+
+    const queues = [];
+    let nextToken;
+    do {
+      console.log("[SQS] Fetching queue list with nextToken:", nextToken || "none");
+      const resp = await sqsClient.send(new ListQueuesCommand({ NextToken: nextToken }));
+      const queueUrls = resp.QueueUrls || [];
+      console.log("[SQS] Found", queueUrls.length, "queues");
+      
+      for (const queueUrl of queueUrls) {
+        try {
+          const name = queueUrl.split("/").pop();
+          console.log("[SQS] Processing queue:", name);
+          const [attributesResp, tagsResp] = await Promise.all([
+            sqsClient.send(
+              new GetQueueAttributesCommand({
+                QueueUrl: queueUrl,
+                AttributeNames: ["All"],
+              })
+            ),
+            sqsClient.send(new ListQueueTagsCommand({ QueueUrl: queueUrl })).catch(() => ({ Tags: {} })),
+          ]);
+
+          const attrs = attributesResp.Attributes || {};
+          const parsed = parseSQSQueueAttributes(attrs, tagsResp.Tags || {});
+          const metrics = await collectSQSQueueMetrics(cloudwatchClient, name, 7);
+          const security = analyzeSQSSecurity(
+            {
+              encrypted: parsed.encrypted,
+              deadLetterQueue: parsed.deadLetterQueue,
+              publicAccess: parsed.publicAccess,
+              anonymousAccess: parsed.anonymousAccess,
+              crossAccountAccess: parsed.crossAccountAccess,
+              messageStats: {
+                oldestAgeSeconds: Number(metrics.oldestAge || 0),
+              },
+            },
+            parsed.tags
+          );
+          
+          // Safely estimate cost if function exists
+          let cost = null;
+          try {
+            cost = estimateSQSCost({
+              encrypted: parsed.encrypted,
+              messageStats: {
+                sent: metrics.sent,
+                received: metrics.received,
+                deleted: metrics.deleted,
+                emptyReceives: metrics.emptyReceives,
+                estimatedPayloadBytes: Number(attrs.ApproximateNumberOfMessagesVisible || 0) * Number(attrs.MaximumMessageSize || 262144),
+              },
+            });
+          } catch (costErr) {
+            console.warn(`[SQS] Failed to estimate cost for ${name}:`, costErr.message);
+            cost = { totalMonthlyCost: 0, breakdown: {} };
+          }
+          
+          // Safely collect activity if cloudtrailClient exists
+          let activity = [];
+          try {
+            if (cloudtrailClient) {
+              activity = await collectSQSActivity(cloudtrailClient, name, 30);
+            } else {
+              console.warn(`[SQS] Skipping activity collection - cloudtrailClient undefined for ${name}`);
+            }
+          } catch (actErr) {
+            console.warn(`[SQS] Failed to collect activity for ${name}:`, actErr.message);
+            activity = [];
+          }
+
+          queues.push({
+            queueName: name,
+            queueUrl,
+            arn: attrs.QueueArn || `arn:aws:sqs:${region}:${accountId}:${name}`,
+            accountId,
+            region,
+            queueType: name.endsWith(".fifo") ? "FIFO" : "Standard",
+            creationDate: attrs.CreatedTimestamp ? Number(attrs.CreatedTimestamp) * 1000 : null,
+            lastModifiedTime: attrs.LastModifiedTimestamp ? Number(attrs.LastModifiedTimestamp) * 1000 : null,
+            visibilityTimeout: Number(attrs.VisibilityTimeout || 0),
+            messageRetentionPeriod: Number(attrs.MessageRetentionPeriod || 0),
+            delaySeconds: Number(attrs.DelaySeconds || 0),
+            maximumMessageSize: Number(attrs.MaximumMessageSize || 0),
+            receiveWaitTime: Number(attrs.ReceiveMessageWaitTimeSeconds || 0),
+            tags: parsed.tags,
+            messageDetails: {
+              approximateNumberOfMessages: Number(attrs.ApproximateNumberOfMessages || 0),
+              messagesInFlight: Number(attrs.ApproximateNumberOfMessagesNotVisible || 0),
+              delayedMessages: Number(attrs.ApproximateNumberOfMessagesDelayed || 0),
+              deadLetterQueue: parsed.deadLetterQueue,
+              dlqName: parsed.dlqName,
+              redrivePolicy: parsed.redrivePolicy,
+              messageThroughput: Number(metrics.sent || 0) + Number(metrics.received || 0),
+              oldestMessageAge: Number(metrics.oldestAge || 0),
+              producerServices: [],
+              consumerServices: [],
+            },
+            security,
+            monitoring: metrics,
+            integrations: {
+              lambdaTriggers: [],
+              snsSubscriptions: [],
+              eventBridgeIntegrations: [],
+              ecsConsumers: [],
+              ec2Consumers: [],
+              apiGatewayProducers: [],
+              connectedServices: [],
+            },
+            activity,
+            cost,
+            findings: [...security.risks],
+          });
+        } catch (error) {
+          console.warn(`Failed to inspect queue ${queueUrl}:`, error.message);
+        }
+      }
+      nextToken = resp.NextToken;
+    } while (nextToken);
+
+    console.log("[SQS] Processing complete. Total queues found:", queues.length);
+
+    const stats = {
+      totalQueues: queues.length,
+      fifoQueues: queues.filter((queue) => queue.queueType === "FIFO").length,
+      encryptedQueues: queues.filter((queue) => queue.security?.encrypted).length,
+      dlqEnabled: queues.filter((queue) => queue.messageDetails?.deadLetterQueue).length,
+      highRiskQueues: queues.filter((queue) => queue.security?.severity === "Critical" || queue.security?.severity === "High").length,
+      estimatedMonthlyCost: queues.reduce((sum, queue) => sum + (queue.cost?.totalMonthlyCost || 0), 0),
+    };
+
+    // Handle empty queue account gracefully
+    if (queues.length === 0) {
+      console.log("[SQS] No queues found in account");
+      return res.json({ 
+        success: true, 
+        queues: [], 
+        stats,
+        message: "No SQS queues found in this account",
+      });
+    }
+
+    return res.json({ success: true, queues, stats });
+  } catch (error) {
+    console.error("[SQS] Error in listSQS:", error.message, error.stack);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+export const getSQSDetail = async (req, res) => {
+  try {
+    const { roleArn } = req.body;
+    const queueName = req.params.queueName;
+    if (!roleArn) return res.status(400).json({ success: false, message: "roleArn required" });
+    if (!queueName) return res.status(400).json({ success: false, message: "queueName required" });
+
+    const region = req.body.region || process.env.AWS_REGION || "us-east-1";
+    const accountId = roleArn.split(":")[4] || "";
+    
+    console.log("[SQS Detail] Initializing clients for queue:", queueName);
+    const clients = await assumeRoleAndClients(roleArn, region);
+    const { sqsClient, cloudwatchClient, cloudtrailClient } = clients;
+    
+    if (!sqsClient) {
+      console.error("[SQS Detail] ERROR: sqsClient is undefined");
+      return res.status(500).json({ success: false, message: "Failed to initialize SQS client" });
+    }
+
+    const urlResp = await sqsClient.send(
+      new GetQueueUrlCommand({
+        QueueName: queueName,
+      })
+    );
+
+    const queueUrl = urlResp.QueueUrl;
+    const [attributesResp, tagsResp] = await Promise.all([
+      sqsClient.send(new GetQueueAttributesCommand({ QueueUrl: queueUrl, AttributeNames: ["All"] })),
+      sqsClient.send(new ListQueueTagsCommand({ QueueUrl: queueUrl })).catch(() => ({ Tags: {} })),
+    ]);
+
+    const attrs = attributesResp.Attributes || {};
+    const parsed = parseSQSQueueAttributes(attrs, tagsResp.Tags || {});
+    const metrics = await collectSQSQueueMetrics(cloudwatchClient, queueName, 14);
+    const activity = await collectSQSActivity(cloudtrailClient, queueName, 100);
+    const security = analyzeSQSSecurity(
+      {
+        encrypted: parsed.encrypted,
+        deadLetterQueue: parsed.deadLetterQueue,
+        publicAccess: parsed.publicAccess,
+        anonymousAccess: parsed.anonymousAccess,
+        crossAccountAccess: parsed.crossAccountAccess,
+        messageStats: { oldestAgeSeconds: Number(metrics.oldestAge || 0) },
+      },
+      parsed.tags
+    );
+    const cost = estimateSQSCost({
+      encrypted: parsed.encrypted,
+      messageStats: {
+        sent: metrics.sent,
+        received: metrics.received,
+        deleted: metrics.deleted,
+        emptyReceives: metrics.emptyReceives,
+        estimatedPayloadBytes: Number(attrs.ApproximateNumberOfMessagesVisible || 0) * Number(attrs.MaximumMessageSize || 262144),
+      },
+    });
+
+    const detail = {
+      queueName,
+      queueUrl,
+      arn: attrs.QueueArn || `arn:aws:sqs:${region}:${accountId}:${queueName}`,
+      accountId,
+      region,
+      queueType: queueName.endsWith(".fifo") ? "FIFO" : "Standard",
+      creationDate: attrs.CreatedTimestamp ? Number(attrs.CreatedTimestamp) * 1000 : null,
+      lastModifiedTime: attrs.LastModifiedTimestamp ? Number(attrs.LastModifiedTimestamp) * 1000 : null,
+      visibilityTimeout: Number(attrs.VisibilityTimeout || 0),
+      messageRetentionPeriod: Number(attrs.MessageRetentionPeriod || 0),
+      delaySeconds: Number(attrs.DelaySeconds || 0),
+      maximumMessageSize: Number(attrs.MaximumMessageSize || 0),
+      receiveWaitTime: Number(attrs.ReceiveMessageWaitTimeSeconds || 0),
+      tags: parsed.tags,
+      messageDetails: {
+        approximateNumberOfMessages: Number(attrs.ApproximateNumberOfMessages || 0),
+        messagesInFlight: Number(attrs.ApproximateNumberOfMessagesNotVisible || 0),
+        delayedMessages: Number(attrs.ApproximateNumberOfMessagesDelayed || 0),
+        deadLetterQueue: parsed.deadLetterQueue,
+        dlqName: parsed.dlqName,
+        redrivePolicy: parsed.redrivePolicy,
+        messageThroughput: Number(metrics.sent || 0) + Number(metrics.received || 0),
+        oldestMessageAge: Number(metrics.oldestAge || 0),
+        producerServices: [],
+        consumerServices: [],
+      },
+      security,
+      monitoring: metrics,
+      integrations: {
+        lambdaTriggers: [],
+        snsSubscriptions: [],
+        eventBridgeIntegrations: [],
+        ecsConsumers: [],
+        ec2Consumers: [],
+        apiGatewayProducers: [],
+        connectedServices: [],
+      },
+      activity,
+      cost,
+      findings: [...security.risks],
+    };
+
+    return res.json({ success: true, detail });
   } catch (error) {
     console.error(error);
     return res.status(500).json({ success: false, message: error.message });

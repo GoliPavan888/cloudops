@@ -3,6 +3,7 @@ import axios from "axios";
 import { ArrowLeft, CalendarDays, Copy, Server, ShieldCheck, Activity, Search, Download } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import Sidebar from "../components/Sidebar";
+import { useAWSConnection } from "../context/AWSConnectionContext.jsx";
 
 function formatDate(value) {
   if (!value) return "-";
@@ -18,6 +19,9 @@ function formatUptime(hours) {
 
 export default function EC2Inventory() {
   const navigate = useNavigate();
+  const { connectedRole } = useAWSConnection();
+  const account = connectedRole || {};
+  const roleArn = account.roleArn || "";
   const [instances, setInstances] = useState([]);
   const [loading, setLoading] = useState(false);
   const [selectedId, setSelectedId] = useState(null);
@@ -37,16 +41,12 @@ export default function EC2Inventory() {
     if (stored.length) setSelectedId(stored[0].instanceId);
 
     // fetch live list from backend if roleArn present
-    const account = JSON.parse(localStorage.getItem("awsAccount") || "{}");
-    const roleArn = localStorage.getItem("roleArn") || account.roleArn;
     if (roleArn) fetchInstances(roleArn, account.region);
-  }, []);
+  }, [roleArn, account.region]);
 
   useEffect(() => {
     // when selection changes, fetch detail and start metrics polling
     if (!selectedId) return;
-    const account = JSON.parse(localStorage.getItem("awsAccount") || "{}");
-    const roleArn = localStorage.getItem("roleArn") || account.roleArn;
     if (!roleArn) return;
 
     fetchDetail(selectedId, roleArn, account.region);
@@ -75,6 +75,20 @@ export default function EC2Inventory() {
       // ignore clipboard failures
     }
   };
+
+  if (!connectedRole) {
+    return (
+      <div className="min-h-screen bg-slate-950 text-white grid place-items-center p-6">
+        <div className="max-w-md rounded-2xl border border-slate-800 bg-slate-900 p-8 text-center">
+          <h1 className="text-2xl font-bold">No AWS account connected</h1>
+          <p className="mt-2 text-sm text-slate-400">Reconnect AWS account to view EC2 inventory.</p>
+          <button onClick={() => navigate("/")} className="mt-6 rounded-xl bg-indigo-500 px-5 py-3 text-sm font-semibold text-white transition hover:bg-indigo-400">
+            Reconnect AWS account
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   async function fetchInstances(roleArn, region) {
     setLoading(true);
@@ -182,7 +196,7 @@ export default function EC2Inventory() {
   return (
     <div className="min-h-screen bg-[#070d1d] text-slate-100">
       <div className="flex min-h-screen">
-        <Sidebar active="ec2" accountId={JSON.parse(localStorage.getItem("awsAccount") || "{}").accountId} region={JSON.parse(localStorage.getItem("awsAccount") || "{}").region} />
+        <Sidebar active="ec2" accountId={account.accountId} region={account.region} />
 
         <main className="flex-1 px-7 py-5">
           <header className="flex items-center justify-between border-b border-slate-800 pb-4">

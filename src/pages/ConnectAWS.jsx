@@ -1,11 +1,13 @@
 import { ShieldCheck } from "lucide-react";
-import axios from "axios";
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { useAWSConnection } from "../context/AWSConnectionContext.jsx";
+import api from "../services/api";
 
 export default function ConnectAWS() {
   const [roleArn, setRoleArn] = useState("");
   const [loading, setLoading] = useState(false);
+  const { setConnectedRole } = useAWSConnection();
 
   const navigate = useNavigate();
 
@@ -13,18 +15,26 @@ export default function ConnectAWS() {
     try {
       setLoading(true);
 
-      const response = await axios.post(
-        "http://localhost:5000/api/aws/connect",
-        { roleArn }
-      );
+      const response = await api.post("/aws/connect", { roleArn });
 
-      // ✅ Save Role ARN before navigating
-      localStorage.setItem("roleArn", roleArn);
+      const account = response.data.account || {};
+      const connectedAt = new Date().toISOString();
+
+      setConnectedRole({
+        roleArn,
+        accountId: account.accountId || roleArn.split(":")[4] || "",
+        accountAlias: account.accountAlias || "",
+        region: account.region || "us-east-1",
+        roleName: account.roleName || roleArn.split("/").pop() || "UnknownRole",
+        assumedRoleArn: account.assumedRoleArn || "",
+        environmentType: account.environmentType || "Development",
+        connectionHealth: account.connectionHealth || "Connected",
+        connectedAt,
+      });
 
       // ✅ Save discovered users
       localStorage.setItem("awsUsers", JSON.stringify(response.data.users));
       localStorage.setItem("awsEc2Instances", JSON.stringify(response.data.ec2Instances || []));
-      localStorage.setItem("awsAccount", JSON.stringify(response.data.account || {}));
       localStorage.setItem("awsMetrics", JSON.stringify(response.data.metrics || {}));
 
       navigate("/dashboard");
